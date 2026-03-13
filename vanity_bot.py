@@ -1,8 +1,6 @@
 """
 vanity_bot.py — Vanity Ethereum Address Generator Telegram Bot
-
-Uses threads (not multiprocessing) for Railway compatibility.
-coincurve + pysha3 release the GIL so threads run truly in parallel.
+Runs on Railway. Uses threads via vanity_worker.py.
 """
 
 import asyncio
@@ -36,14 +34,13 @@ if not TELEGRAM_BOT_TOKEN:
     raise SystemExit("❌ TELEGRAM_BOT_TOKEN not set.")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-POLL_INTERVAL = 2.0
-EDIT_INTERVAL = 5.0
-EXTRACT_CHARS = 4
-NUM_WORKERS   = 4  # cap at 4 — Railway reports many cores but more threads = more GIL contention
+POLL_INTERVAL  = 0.5    # check queue every 0.5s so fast results aren't missed
+EDIT_INTERVAL  = 5.0    # seconds between Telegram message edits
+EXTRACT_CHARS  = 4
+NUM_WORKERS    = 4      # fixed at 4 — Railway has many cores but 4 is optimal
 
 ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
-
-_executor = ThreadPoolExecutor(max_workers=NUM_WORKERS)
+_executor      = ThreadPoolExecutor(max_workers=NUM_WORKERS)
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -79,16 +76,6 @@ def estimate_attempts(n: int) -> str:
     return str(val)
 
 
-def kill_job(chat_id: int) -> None:
-    job = active_jobs.pop(chat_id, None)
-    if not job:
-        return
-    job["stop_event"].set()
-    task = job.get("task")
-    if task and not task.done():
-        task.cancel()
-
-
 def drain_queue(q: queue.Queue) -> list:
     items = []
     while True:
@@ -97,6 +84,17 @@ def drain_queue(q: queue.Queue) -> list:
         except queue.Empty:
             break
     return items
+
+
+def kill_job(chat_id: int) -> None:
+    """Stop workers and cancel poll task for a chat."""
+    job = active_jobs.pop(chat_id, None)
+    if not job:
+        return
+    job["stop_event"].set()
+    task = job.get("task")
+    if task and not task.done():
+        task.cancel()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -115,51 +113,56 @@ async def _poll(
     last_edit = time.monotonic()
     display   = f"0x{pattern}..." if mode == "prefix" else f"0x...{pattern}"
     total     = 0
-    loop      = asyncio.get_event_loop()
+
+    async def send_found(addr: str, key: str) -> None:
+        """Edit the status message with the found result."""
+        elapsed = time.monotonic() - start_time
+        rate    = int(total / elapsed) if elapsed > 0 else 0
+        # Remove from active jobs without cancelling ourselves
+        active_jobs.pop(chat_id, None)
+        stop_event.set()
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Copy Address",      callback_data=f"copy:{addr}")],
+            [InlineKeyboardButton("📋 Copy Private Key",  callback_data=f"copy:{key}")],
+            [InlineKeyboardButton("🔗 View on Etherscan", url=f"https://etherscan.io/address/{addr}")],
+        ])
+        await status_msg.edit_text(
+            "✅ *Vanity Address Found\\!*\n\n"
+            f"🎯 *Pattern:* `{esc(display)}`\n\n"
+            f"📬 *Address:*\n`{addr}`\n\n"
+            f"🔑 *Private Key:*\n`{key}`\n\n"
+            "─────────────────────────\n"
+            f"🔁 *Attempts:* {esc(f'{total:,}')}\n"
+            f"⏱ *Time:* {esc(f'{elapsed:.1f}s')}\n"
+            f"⚡ *Speed:* {esc(f'{rate:,}')} addr/s\n\n"
+            "⚠️ _Keep your private key secret\\. Never share it\\._",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=kb,
+        )
 
     try:
         while True:
             await asyncio.sleep(POLL_INTERVAL)
 
-            items   = await loop.run_in_executor(None, drain_queue, result_queue)
-            elapsed = time.monotonic() - start_time
-            rate    = int(total / elapsed) if elapsed > 0 else 0
+            # Drain everything currently in the queue
+            items = drain_queue(result_queue)
 
             for item in items:
-                kind = item[0]
-
-                if kind == "progress":
+                if item[0] == "progress":
                     total += item[2]
 
-                elif kind == "found":
+                elif item[0] == "found":
                     _, _wid, attempts, addr, key = item
                     total += attempts
-                    kill_job(chat_id)
+                    await send_found(addr, key)
+                    return  # done
 
-                    kb = InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📋 Copy Address",      callback_data=f"copy:{addr}")],
-                        [InlineKeyboardButton("📋 Copy Private Key",  callback_data=f"copy:{key}")],
-                        [InlineKeyboardButton("🔗 View on Etherscan", url=f"https://etherscan.io/address/{addr}")],
-                    ])
-                    await status_msg.edit_text(
-                        "✅ *Vanity Address Found\\!*\n\n"
-                        f"🎯 *Pattern:* `{esc(display)}`\n\n"
-                        f"📬 *Address:*\n`{addr}`\n\n"
-                        f"🔑 *Private Key:*\n`{key}`\n\n"
-                        "─────────────────────────\n"
-                        f"🔁 *Attempts:* {esc(f'{total:,}')}\n"
-                        f"⏱ *Time:* {esc(f'{elapsed:.1f}s')}\n"
-                        f"⚡ *Speed:* {esc(f'{rate:,}')} addr/s\n\n"
-                        "⚠️ _Keep your private key secret\\. Never share it\\._",
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                        reply_markup=kb,
-                    )
-                    return
-
-            # ── Progress edit ─────────────────────────────────────────────────
+            # Progress edit
             now = time.monotonic()
             if now - last_edit >= EDIT_INTERVAL:
                 last_edit = now
+                elapsed = now - start_time
+                rate    = int(total / elapsed) if elapsed > 0 else 0
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{chat_id}")],
                     [InlineKeyboardButton("🛑 Cancel",  callback_data=f"canceljob:{chat_id}")],
@@ -179,6 +182,17 @@ async def _poll(
                     pass
 
     except asyncio.CancelledError:
+        # Final drain — result might already be sitting in the queue
+        try:
+            items = drain_queue(result_queue)
+            for item in items:
+                if item[0] == "found":
+                    _, _wid, attempts, addr, key = item
+                    total += attempts
+                    await send_found(addr, key)
+                    return
+        except Exception:
+            pass
         logger.info("Poll cancelled for chat %s", chat_id)
         raise
 
@@ -208,11 +222,13 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
     start_time   = time.monotonic()
     loop         = asyncio.get_event_loop()
 
-    logger.info("Chat %s | started | mode=%s pattern='%s' | %d workers", chat_id, mode, pattern, NUM_WORKERS)
-
+    # Start worker threads
     for i in range(NUM_WORKERS):
         loop.run_in_executor(_executor, _worker, i, pattern, mode, result_queue, stop_event)
 
+    logger.info("Chat %s | mode=%s pattern='%s' | %d workers", chat_id, mode, pattern, NUM_WORKERS)
+
+    # Start poll task AFTER storing in active_jobs so kill_job works correctly
     task = asyncio.create_task(
         _poll(
             chat_id=chat_id,
@@ -293,12 +309,12 @@ async def handle_search_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
     query   = update.callback_query
     chat_id = query.message.chat_id
     await query.answer()
+    # callback_data = "search:prefix:dead" → parts[1]=mode, parts[2]=pattern
     parts   = query.data.split(":", 2)
 
     async def send_status(text: str):
         return await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
 
-    # callback_data = "search:prefix:dead" → parts[1]=mode, parts[2]=pattern
     await launch_search(chat_id, parts[2], parts[1], send_status)
 
 
@@ -315,8 +331,7 @@ async def handle_refresh_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYP
         )
         return
 
-    loop    = asyncio.get_event_loop()
-    items   = await loop.run_in_executor(None, drain_queue, job["result_queue"])
+    items   = drain_queue(job["result_queue"])
     elapsed = time.monotonic() - job["start_time"]
     total   = job.get("total", 0) + sum(i[2] for i in items if i[0] == "progress")
     job["total"] = total
