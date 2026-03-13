@@ -1,27 +1,25 @@
 """
-vanity_worker.py — fast address worker using coincurve + pysha3.
+vanity_worker.py — Vanity address worker using threads (no multiprocessing).
 
-Speed:
-  coincurve + pysha3       ~18,000 addr/s per core  ← target
-  coincurve + pycryptodome  ~8,000 addr/s per core
-  eth_account (fallback)      ~500 addr/s per core  ← what you had before
+coincurve and pysha3 are C extensions that release Python's GIL,
+so threads genuinely run in parallel for this workload.
+This works in all environments including Railway containers.
 
-Queue messages (unchanged interface):
+Queue messages:
   ("progress", worker_id, attempt_count)
   ("found",    worker_id, attempt_count, address, private_key_hex)
 """
 
 import os
-from multiprocessing import Queue, Value
+import threading
+from queue import Queue
 
-# How often each worker reports progress back to the bot
 REPORT_EVERY = 1_000
 
 
 # ── Pick fastest available library ───────────────────────────────────────────
 
 def _build_generator():
-    # Option 1: coincurve + pysha3 (fastest — both are C extensions that release the GIL)
     try:
         from coincurve import PublicKey
         from sha3 import keccak_256
@@ -36,13 +34,12 @@ def _build_generator():
                 except Exception:
                     continue
 
-        print("[vanity_worker] Generator: coincurve + pysha3 ✓ (fast)")
+        print("[vanity_worker] Generator: coincurve + pysha3 ✓ (fast)", flush=True)
         return _gen
 
     except ImportError:
         pass
 
-    # Option 2: coincurve + pycryptodome
     try:
         from coincurve import PublicKey
         from Crypto.Hash import keccak as _kmod
@@ -59,13 +56,12 @@ def _build_generator():
                 except Exception:
                     continue
 
-        print("[vanity_worker] Generator: coincurve + pycryptodome (medium)")
+        print("[vanity_worker] Generator: coincurve + pycryptodome (medium)", flush=True)
         return _gen
 
     except ImportError:
         pass
 
-    # Option 3: eth_account fallback (slow — warns loudly)
     try:
         import secrets
         from eth_account import Account
@@ -80,16 +76,13 @@ def _build_generator():
                 except Exception:
                     continue
 
-        print("[vanity_worker] ⚠ Generator: eth_account (SLOW). Add pysha3 to requirements.txt")
+        print("[vanity_worker] ⚠ Generator: eth_account (SLOW). Add pysha3 to requirements.txt", flush=True)
         return _gen
 
     except ImportError:
         pass
 
-    raise RuntimeError(
-        "No crypto library found! "
-        "Add to requirements.txt: coincurve, pysha3"
-    )
+    raise RuntimeError("No crypto library found. Add coincurve and pysha3 to requirements.txt")
 
 
 _generate = _build_generator()
@@ -102,24 +95,24 @@ def _matches(address: str, pattern: str, mode: str) -> bool:
     return body.startswith(pattern) if mode == "prefix" else body.endswith(pattern)
 
 
-# ── Worker (drop-in replacement — same signature as before) ──────────────────
+# ── Worker function (runs in a thread) ───────────────────────────────────────
 
 def worker(
     worker_id: int,
     pattern: str,
     mode: str,
     result_queue: Queue,
-    stop_flag: Value,
+    stop_event: threading.Event,
 ) -> None:
     attempts = 0
 
-    while not stop_flag.value:
+    while not stop_event.is_set():
         address, private_key_hex = _generate()
         attempts += 1
 
         if _matches(address, pattern, mode):
-            stop_flag.value = 1
             result_queue.put(("found", worker_id, attempts, address, private_key_hex))
+            stop_event.set()
             return
 
         if attempts % REPORT_EVERY == 0:
