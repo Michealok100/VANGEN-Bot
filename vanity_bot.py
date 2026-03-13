@@ -1,15 +1,10 @@
 """
 vanity_bot.py — Vanity Ethereum Address Generator Telegram Bot
-==============================================================
-Fast address generation using coincurve (secp256k1) + pycryptodome (Keccak-256).
-This bypasses the slow eth_account wrapper and generates addresses at full speed.
 
-HOW ETH ADDRESS DERIVATION WORKS:
-  1. secrets.token_bytes(32)        → secure random 32-byte private key
-  2. coincurve.PrivateKey(bytes)     → secp256k1 public key (fast C library)
-  3. public_key.format(compressed=False)[1:]  → 64-byte uncompressed pubkey
-  4. Keccak-256(pubkey)             → 32-byte hash (pycryptodome, fast C)
-  5. last 20 bytes → "0x" prefix   → Ethereum address
+Fix for freezing: worker runs via asyncio.run_in_executor() which keeps
+the asyncio event loop fully responsive while CPU-heavy search runs in
+a background thread. The thread never touches asyncio — it only writes
+to a shared dict that the asyncio polling task reads.
 """
 
 import asyncio
@@ -19,9 +14,8 @@ import re
 import secrets
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
-import coincurve
-from Crypto.Hash import keccak as _keccak
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -38,21 +32,20 @@ from telegram.ext import (
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-
 if not TELEGRAM_BOT_TOKEN:
-    raise SystemExit(
-        "\n❌ ERROR: TELEGRAM_BOT_TOKEN is not set.\n"
-        "  • Local: add it to your .env file\n"
-        "  • Railway: add it in the Variables tab\n"
-    )
+    raise SystemExit("❌ ERROR: TELEGRAM_BOT_TOKEN is not set.")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-NUM_WORKERS   = max(2, (os.cpu_count() or 2))
-POLL_INTERVAL = 1.5
-EDIT_INTERVAL = 3.0
+POLL_INTERVAL = 2.0
+EDIT_INTERVAL = 4.0
 EXTRACT_CHARS = 4
+REPORT_EVERY  = 500     # worker updates shared dict every N attempts
 
 ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_CURVE_ORDER   = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+# Thread pool — reused across searches so threads spin up faster
+_executor = ThreadPoolExecutor(max_workers=4)
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -64,48 +57,109 @@ active_jobs: dict[int, dict] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FAST ADDRESS DERIVATION  (coincurve + pycryptodome)
+#  ADDRESS GENERATOR  — fastest available lib, chosen at startup
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _keccak256(data: bytes) -> bytes:
-    """Fast Keccak-256 via pycryptodome C extension."""
-    k = _keccak.new(digest_bits=256)
-    k.update(data)
-    return k.digest()
+def _build_generator():
+    """Pick the fastest available address generator at startup."""
 
-
-# secp256k1 curve order — private key must be > 0 and < this value
-_CURVE_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-
-def generate_address() -> tuple[str, str] | None:
-    """
-    Generate a random private key and derive its Ethereum address.
-    Returns (address, private_key_hex) or None if the key is invalid
-    (astronomically rare but handled safely).
-
-    Steps:
-    1. Generate 32 secure random bytes as private key
-    2. Validate key is in valid secp256k1 range (> 0 and < curve order)
-    3. Use coincurve (libsecp256k1 C library) to get the public key
-    4. Strip the 0x04 uncompressed prefix → 64-byte pubkey
-    5. Keccak-256 hash the pubkey (pycryptodome C extension)
-    6. Take the last 20 bytes → Ethereum address
-    """
-    priv_bytes = secrets.token_bytes(32)
-
-    # Validate key range — skip if invalid (probability ~1 in 2^128)
-    priv_int = int.from_bytes(priv_bytes, "big")
-    if priv_int == 0 or priv_int >= _CURVE_ORDER:
-        return None
-
+    # Option 1: coincurve + pycryptodome (fastest — C extensions)
     try:
-        priv_key  = coincurve.PrivateKey(priv_bytes)
-        pub_bytes = priv_key.public_key.format(compressed=False)[1:]  # strip 0x04
-        digest    = _keccak256(pub_bytes)
-        address   = "0x" + digest[-20:].hex()
-        return address, "0x" + priv_bytes.hex()
-    except Exception:
-        return None   # skip any rare coincurve errors
+        import coincurve
+        from Crypto.Hash import keccak as _kmod
+
+        def _gen() -> tuple[str, str] | None:
+            priv = secrets.token_bytes(32)
+            if int.from_bytes(priv, "big") in (0, _CURVE_ORDER):
+                return None
+            try:
+                pub    = coincurve.PrivateKey(priv).public_key.format(compressed=False)[1:]
+                k      = _kmod.new(digest_bits=256)
+                k.update(pub)
+                addr   = "0x" + k.digest()[-20:].hex()
+                return addr, "0x" + priv.hex()
+            except Exception:
+                return None
+
+        logger.info("Generator: coincurve + pycryptodome")
+        return _gen
+
+    except ImportError:
+        pass
+
+    # Option 2: eth_account (slower but reliable)
+    try:
+        from eth_account import Account
+
+        def _gen() -> tuple[str, str] | None:
+            priv = secrets.token_bytes(32)
+            if int.from_bytes(priv, "big") in (0, _CURVE_ORDER):
+                return None
+            try:
+                key  = "0x" + priv.hex()
+                addr = Account.from_key(key).address
+                return addr, key
+            except Exception:
+                return None
+
+        logger.info("Generator: eth_account")
+        return _gen
+
+    except ImportError:
+        pass
+
+    raise SystemExit("❌ No crypto library available. Add eth-account to requirements.txt")
+
+
+_generate = _build_generator()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  WORKER  — runs in executor thread, never touches asyncio
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _search_worker(
+    pattern: str,
+    mode: str,
+    stop_event: threading.Event,
+    shared: dict,
+) -> None:
+    """
+    Tight search loop. Runs inside run_in_executor so asyncio stays alive.
+    Only writes to shared dict — never calls any asyncio functions.
+    """
+    attempts = 0
+    last_report = 0
+
+    while not stop_event.is_set():
+        try:
+            result = _generate()
+            if result is None:
+                continue
+
+            addr, key = result
+            attempts += 1
+
+            # Report progress every REPORT_EVERY attempts
+            if attempts - last_report >= REPORT_EVERY:
+                shared["attempts"] = attempts
+                last_report = attempts
+
+            # Check match
+            body    = addr[2:].lower()
+            matched = body.startswith(pattern) if mode == "prefix" else body.endswith(pattern)
+
+            if matched:
+                shared["attempts"]    = attempts
+                shared["address"]     = addr
+                shared["private_key"] = key
+                stop_event.set()
+                return
+
+        except Exception as exc:
+            logger.warning("Worker error (skipping): %s", exc)
+
+    shared["attempts"] = attempts
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -125,11 +179,11 @@ def extract_patterns(address: str) -> tuple[str, str]:
 def estimate_attempts(n: int) -> str:
     val = 16 ** n
     if val >= 1_000_000_000:
-        return f"{val / 1_000_000_000:.1f}B"
+        return f"{val/1_000_000_000:.1f}B"
     if val >= 1_000_000:
-        return f"{val / 1_000_000:.1f}M"
+        return f"{val/1_000_000:.1f}M"
     if val >= 1_000:
-        return f"{val / 1_000:.1f}K"
+        return f"{val/1_000:.1f}K"
     return str(val)
 
 
@@ -144,113 +198,65 @@ def kill_job(chat_id: int) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  WORKER THREAD
+#  ASYNCIO POLLING TASK
 # ══════════════════════════════════════════════════════════════════════════════
 
-def search_worker(
-    worker_id: int,
-    pattern: str,
-    mode: str,
-    stop_event: threading.Event,
-    result: dict,
-    counters: list,
-) -> None:
-    """
-    Thread worker — generates addresses at maximum speed using
-    coincurve + pycryptodome C extensions. Updates counters[worker_id]
-    on every attempt so the progress display is always accurate.
-    """
-    attempts = 0
-
-    while not stop_event.is_set():
-        try:
-            generated = generate_address()
-
-            # Skip invalid keys (extremely rare) without counting as attempt
-            if generated is None:
-                continue
-
-            address, private_key = generated
-            attempts += 1
-            counters[worker_id] = attempts
-
-            # Check match against lowercase address body (strip 0x)
-            body    = address[2:].lower()
-            matched = body.startswith(pattern) if mode == "prefix" else body.endswith(pattern)
-
-            if matched:
-                result["address"]     = address
-                result["private_key"] = private_key
-                stop_event.set()
-                return
-
-        except Exception as e:
-            # Log and continue — never let a single bad key kill the thread
-            logger.warning("Worker %d skipped error: %s", worker_id, e)
-            continue
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  BACKGROUND ASYNCIO POLLING TASK
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def poll_results(
+async def _poll(
     chat_id: int,
-    status_message,
+    status_msg,
     pattern: str,
     mode: str,
     stop_event: threading.Event,
-    result: dict,
-    counters: list,
+    shared: dict,
     start_time: float,
 ) -> None:
-    last_edit = time.monotonic()
-    display   = f"0x{pattern}..." if mode == "prefix" else f"0x...{pattern}"
+    last_edit  = time.monotonic()
+    display    = f"0x{pattern}..." if mode == "prefix" else f"0x...{pattern}"
 
     try:
         while True:
             await asyncio.sleep(POLL_INTERVAL)
 
-            total   = sum(counters)
+            total   = shared.get("attempts", 0)
             elapsed = time.monotonic() - start_time
             rate    = int(total / elapsed) if elapsed > 0 else 0
 
-            # ── Match found ───────────────────────────────────────────────────
-            if stop_event.is_set() and result.get("address"):
-                address     = result["address"]
-                private_key = result["private_key"]
+            # ── Found ─────────────────────────────────────────────────────────
+            if stop_event.is_set() and shared.get("address"):
+                addr = shared["address"]
+                key  = shared["private_key"]
                 kill_job(chat_id)
 
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📋 Copy Address",      callback_data=f"copy:{address}")],
-                    [InlineKeyboardButton("📋 Copy Private Key",  callback_data=f"copy:{private_key}")],
-                    [InlineKeyboardButton("🔗 View on Etherscan", url=f"https://etherscan.io/address/{address}")],
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 Copy Address",      callback_data=f"copy:{addr}")],
+                    [InlineKeyboardButton("📋 Copy Private Key",  callback_data=f"copy:{key}")],
+                    [InlineKeyboardButton("🔗 View on Etherscan", url=f"https://etherscan.io/address/{addr}")],
                 ])
-                await status_message.edit_text(
+                await status_msg.edit_text(
                     "✅ *Vanity Address Found\\!*\n\n"
                     f"🎯 *Pattern:* `{esc(display)}`\n\n"
-                    f"📬 *Address:*\n`{address}`\n\n"
-                    f"🔑 *Private Key:*\n`{private_key}`\n\n"
+                    f"📬 *Address:*\n`{addr}`\n\n"
+                    f"🔑 *Private Key:*\n`{key}`\n\n"
                     "─────────────────────────\n"
                     f"🔁 *Attempts:* {esc(f'{total:,}')}\n"
                     f"⏱ *Time:* {esc(f'{elapsed:.1f}s')}\n"
                     f"⚡ *Speed:* {esc(f'{rate:,}')} addr/s\n\n"
                     "⚠️ _Keep your private key secret\\. Never share it\\._",
                     parse_mode=ParseMode.MARKDOWN_V2,
-                    reply_markup=keyboard,
+                    reply_markup=kb,
                 )
                 return
 
-            # ── Periodic progress update ──────────────────────────────────────
+            # ── Progress update ───────────────────────────────────────────────
             now = time.monotonic()
             if now - last_edit >= EDIT_INTERVAL:
                 last_edit = now
-                refresh_kb = InlineKeyboardMarkup([
+                kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔄 Refresh Progress", callback_data=f"refresh:{chat_id}")],
                     [InlineKeyboardButton("🛑 Cancel Search",    callback_data=f"canceljob:{chat_id}")],
                 ])
                 try:
-                    await status_message.edit_text(
+                    await status_msg.edit_text(
                         "🔄 *Searching for vanity address…*\n\n"
                         f"🎯 *Pattern:* `{esc(display)}`\n\n"
                         f"🔁 Attempts: *{esc(f'{total:,}')}*\n"
@@ -258,13 +264,13 @@ async def poll_results(
                         f"⏱ Elapsed: *{esc(f'{elapsed:.0f}s')}*\n\n"
                         "_Tap Refresh to update stats\\._",
                         parse_mode=ParseMode.MARKDOWN_V2,
-                        reply_markup=refresh_kb,
+                        reply_markup=kb,
                     )
                 except Exception:
                     pass
 
     except asyncio.CancelledError:
-        logger.info("Poll task cancelled for chat %s", chat_id)
+        logger.info("Poll cancelled for chat %s", chat_id)
         raise
 
 
@@ -275,7 +281,7 @@ async def poll_results(
 async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None:
     if chat_id in active_jobs:
         kill_job(chat_id)
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.3)
 
     display  = f"0x{pattern}..." if mode == "prefix" else f"0x...{pattern}"
     expected = estimate_attempts(len(pattern))
@@ -283,48 +289,32 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
     status_msg = await reply_fn(
         "🔄 *Starting vanity search…*\n\n"
         f"🎯 *Pattern:* `{esc(display)}`\n"
-        f"📊 *Expected:* \\~{esc(expected)} attempts\n"
-        f"⚙️ *Workers:* {esc(str(NUM_WORKERS))}\n\n"
-        "_Spinning up workers\\.\\.\\._"
+        f"📊 *Expected:* \\~{esc(expected)} attempts\n\n"
+        "_Spinning up worker\\.\\.\\._"
     )
 
     stop_event = threading.Event()
-    result     = {}
-    counters   = [0] * NUM_WORKERS
+    shared     = {"attempts": 0}
     start_time = time.monotonic()
+    loop       = asyncio.get_event_loop()
 
-    def start_worker(wid: int) -> threading.Thread:
-        t = threading.Thread(
-            target=search_worker,
-            args=(wid, pattern, mode, stop_event, result, counters),
-            daemon=True,
-        )
-        t.start()
-        return t
+    # Run worker in executor — asyncio stays fully responsive
+    loop.run_in_executor(
+        _executor,
+        _search_worker,
+        pattern, mode, stop_event, shared,
+    )
 
-    threads = [start_worker(wid) for wid in range(NUM_WORKERS)]
-    logger.info("Chat %s | %d threads | %s %s", chat_id, NUM_WORKERS, mode, pattern)
-
-    def watchdog() -> None:
-        """Restart any worker thread that dies unexpectedly."""
-        while not stop_event.is_set():
-            time.sleep(2)
-            for wid, t in enumerate(threads):
-                if not stop_event.is_set() and not t.is_alive():
-                    logger.warning("Worker %d died — restarting", wid)
-                    threads[wid] = start_worker(wid)
-
-    threading.Thread(target=watchdog, daemon=True).start()
+    logger.info("Chat %s | search started | %s %s", chat_id, mode, pattern)
 
     task = asyncio.create_task(
-        poll_results(
+        _poll(
             chat_id=chat_id,
-            status_message=status_msg,
+            status_msg=status_msg,
             pattern=pattern,
             mode=mode,
             stop_event=stop_event,
-            result=result,
-            counters=counters,
+            shared=shared,
             start_time=start_time,
         )
     )
@@ -332,7 +322,7 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
     active_jobs[chat_id] = {
         "stop_event": stop_event,
         "task":       task,
-        "counters":   counters,
+        "shared":     shared,
         "start_time": start_time,
         "pattern":    pattern,
         "mode":       mode,
@@ -340,14 +330,13 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  HANDLERS
+#  COMMAND & MESSAGE HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🔐 Vanity Ethereum Address Generator\n\n"
-        "Simply paste any Ethereum address and I will extract the prefix "
-        "and suffix automatically for you to choose.\n\n"
+        "Paste any Ethereum address and I extract the prefix and suffix automatically.\n\n"
         "How to use:\n"
         "1. Paste an Ethereum address\n"
         "2. I extract the first and last 4 characters\n"
@@ -356,7 +345,6 @@ async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "4 chars = ~65K attempts (seconds)\n"
         "5 chars = ~1M attempts (1-2 min)\n"
         "6 chars = ~16M attempts (30-60 min)\n\n"
-        "Each extra character is 16x harder.\n\n"
         "Use /cancel to stop any active search."
     )
 
@@ -375,7 +363,7 @@ async def handle_address_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
 
     prefix, suffix = extract_patterns(text)
 
-    keyboard = InlineKeyboardMarkup([
+    kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🔵 Match Prefix → 0x{prefix}…", callback_data=f"search:prefix:{prefix}")],
         [InlineKeyboardButton(f"🟣 Match Suffix → 0x…{suffix}", callback_data=f"search:suffix:{suffix}")],
     ])
@@ -384,12 +372,12 @@ async def handle_address_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
         "✅ *Address received\\!*\n\n"
         f"`{esc(text)}`\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "I extracted these patterns:\n\n"
+        "Extracted patterns:\n\n"
         f"🔵 *Prefix:* `0x{esc(prefix)}…`\n"
         f"🟣 *Suffix:* `0x…{esc(suffix)}`\n\n"
         "👇 *Which would you like to search for?*",
         parse_mode=ParseMode.MARKDOWN_V2,
-        reply_markup=keyboard,
+        reply_markup=kb,
     )
 
 
@@ -398,13 +386,11 @@ async def handle_search_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
     chat_id = query.message.chat_id
     await query.answer()
     parts   = query.data.split(":", 2)
-    mode    = parts[1]
-    pattern = parts[2]
 
     async def send_status(text: str):
         return await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
 
-    await launch_search(chat_id, pattern, mode, send_status)
+    await launch_search(chat_id, parts[1], parts[2], send_status)
 
 
 async def handle_refresh_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -414,17 +400,18 @@ async def handle_refresh_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYP
 
     job = active_jobs.get(chat_id)
     if not job:
-        await query.message.reply_text("No active search found. It may have already completed.")
+        await query.message.reply_text("No active search. It may have already completed.")
         return
 
-    total   = sum(job["counters"])
+    shared  = job["shared"]
+    total   = shared.get("attempts", 0)
     elapsed = time.monotonic() - job["start_time"]
     rate    = int(total / elapsed) if elapsed > 0 else 0
     pattern = job["pattern"]
     mode    = job["mode"]
     display = f"0x{pattern}..." if mode == "prefix" else f"0x...{pattern}"
 
-    refresh_kb = InlineKeyboardMarkup([
+    kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Refresh Progress", callback_data=f"refresh:{chat_id}")],
         [InlineKeyboardButton("🛑 Cancel Search",    callback_data=f"canceljob:{chat_id}")],
     ])
@@ -437,7 +424,7 @@ async def handle_refresh_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYP
             f"⏱ Elapsed: *{esc(f'{elapsed:.0f}s')}*\n\n"
             "_Tap Refresh to update stats\\._",
             parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=refresh_kb,
+            reply_markup=kb,
         )
     except Exception:
         pass
@@ -485,7 +472,7 @@ async def cmd_cancel(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    logger.info("Starting Vanity ETH Bot | %d threads per search", NUM_WORKERS)
+    logger.info("Starting Vanity ETH Bot")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -502,7 +489,7 @@ def main() -> None:
 
     app.add_error_handler(error_handler)
 
-    logger.info("Bot is running. Press Ctrl+C to stop.")
+    logger.info("Bot is running.")
     app.run_polling(allowed_updates=["message", "callback_query"])
 
 
