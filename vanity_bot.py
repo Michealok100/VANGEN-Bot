@@ -1,5 +1,11 @@
 """
 vanity_worker.py — Vanity address worker (runs in a separate process).
+
+HOW ETHEREUM ADDRESSES ARE DERIVED:
+1. Generate secure random 32-byte private key
+2. secp256k1 elliptic curve multiplication → 64-byte public key
+3. Keccak-256 hash the public key
+4. Take last 20 bytes → prefix 0x → Ethereum address
 """
 
 import secrets
