@@ -174,14 +174,19 @@ async def poll_results(
                 last_edit = now
                 display   = f"0x{pattern}..." if mode == "prefix" else f"0x...{pattern}"
                 try:
+                    refresh_kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Refresh Progress", callback_data=f"refresh:{chat_id}")],
+                        [InlineKeyboardButton("🛑 Cancel Search",    callback_data=f"canceljob:{chat_id}")],
+                    ])
                     await status_message.edit_text(
                         "🔄 *Searching for vanity address…*\n\n"
                         f"🎯 *Pattern:* `{esc(display)}`\n\n"
                         f"🔁 Attempts: *{esc(f'{total:,}')}*\n"
                         f"⚡ Speed: *{esc(f'{rate:,}')}* addr/s\n"
                         f"⏱ Elapsed: *{esc(f'{elapsed:.0f}s')}*\n\n"
-                        "_Use /cancel to stop the search\\._",
+                        "_Tap Refresh to update stats\._",
                         parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=refresh_kb,
                     )
                 except Exception:
                     pass
@@ -240,7 +245,15 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
         )
     )
 
-    active_jobs[chat_id] = {"processes": processes, "stop_flag": stop_flag, "task": task}
+    active_jobs[chat_id] = {
+        "processes":      processes,
+        "stop_flag":      stop_flag,
+        "task":           task,
+        "worker_attempts": worker_attempts,
+        "start_time":     start_time,
+        "pattern":        pattern,
+        "mode":           mode,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -356,6 +369,66 @@ async def cmd_cancel(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def handle_refresh_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the Refresh Progress button — instantly shows latest stats."""
+    query   = update.callback_query
+    chat_id = int(query.data.split(":")[1])
+    await query.answer("Refreshed!")
+
+    job = active_jobs.get(chat_id)
+    if not job:
+        await query.message.reply_text("No active search found. It may have already completed.")
+        return
+
+    worker_attempts = job["worker_attempts"]
+    start_time      = job["start_time"]
+    pattern         = job["pattern"]
+    mode            = job["mode"]
+
+    total   = sum(worker_attempts.values())
+    elapsed = time.monotonic() - start_time
+    rate    = int(total / elapsed) if elapsed > 0 else 0
+    display = f"0x{pattern}..." if mode == "prefix" else f"0x...{pattern}"
+
+    refresh_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh Progress", callback_data=f"refresh:{chat_id}")],
+        [InlineKeyboardButton("🛑 Cancel Search",    callback_data=f"canceljob:{chat_id}")],
+    ])
+
+    try:
+        await query.message.edit_text(
+            "🔄 *Searching for vanity address…*\n\n"
+            f"🎯 *Pattern:* `{esc(display)}`\n\n"
+            f"🔁 Attempts: *{esc(f'{total:,}')}*\n"
+            f"⚡ Speed: *{esc(f'{rate:,}')}* addr/s\n"
+            f"⏱ Elapsed: *{esc(f'{elapsed:.0f}s')}*\n\n"
+            "_Tap Refresh to update stats\._",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=refresh_kb,
+        )
+    except Exception:
+        pass
+
+
+async def handle_cancelJob_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the Cancel Search inline button."""
+    query   = update.callback_query
+    chat_id = int(query.data.split(":")[1])
+    await query.answer("Cancelled!")
+
+    if chat_id in active_jobs:
+        kill_job(chat_id)
+
+    try:
+        await query.message.edit_text(
+            "🛑 *Search cancelled\.*\n\n"
+            "_Paste an Ethereum address to start a new search\._",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    except Exception:
+        pass
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -368,7 +441,9 @@ def main() -> None:
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(handle_search_callback, pattern=r"^search:"))
-    app.add_handler(CallbackQueryHandler(handle_copy_callback,   pattern=r"^copy:"))
+    app.add_handler(CallbackQueryHandler(handle_copy_callback,      pattern=r"^copy:"))
+    app.add_handler(CallbackQueryHandler(handle_refresh_callback,   pattern=r"^refresh:"))
+    app.add_handler(CallbackQueryHandler(handle_cancelJob_callback, pattern=r"^canceljob:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_address_message))
 
     # Global error handler — logs any unhandled exceptions so they appear in Railway logs
