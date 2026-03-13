@@ -1,17 +1,18 @@
 """
 vanity_bot.py — Vanity Ethereum Address Generator Telegram Bot
 
-Fix for freezing: worker runs via asyncio.run_in_executor() which keeps
-the asyncio event loop fully responsive while CPU-heavy search runs in
-a background thread. The thread never touches asyncio — it only writes
-to a shared dict that the asyncio polling task reads.
+Performance fixes applied:
+1. Multi-threaded search — one worker per CPU core instead of just one.
+2. Shared atomic attempt counter across all workers so stats are accurate.
+3. REPORT_EVERY lowered to 100 for more responsive progress updates.
+4. os.urandom() used instead of secrets.token_bytes() for a small speed gain.
+5. coincurve + pycryptodome is still preferred; eth_account fallback unchanged.
 """
 
 import asyncio
 import logging
 import os
 import re
-import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -39,13 +40,14 @@ if not TELEGRAM_BOT_TOKEN:
 POLL_INTERVAL = 2.0
 EDIT_INTERVAL = 4.0
 EXTRACT_CHARS = 4
-REPORT_EVERY  = 500     # worker updates shared dict every N attempts
+REPORT_EVERY  = 100     # FIX #3: lowered from 500 → more responsive stats
 
 ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _CURVE_ORDER   = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
-# Thread pool — reused across searches so threads spin up faster
-_executor = ThreadPoolExecutor(max_workers=4)
+# FIX #1: size the pool to the number of CPU cores
+NUM_WORKERS = os.cpu_count() or 4
+_executor   = ThreadPoolExecutor(max_workers=NUM_WORKERS)
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -69,19 +71,20 @@ def _build_generator():
         from Crypto.Hash import keccak as _kmod
 
         def _gen() -> tuple[str, str] | None:
-            priv = secrets.token_bytes(32)
+            # FIX #4: os.urandom is slightly faster than secrets.token_bytes
+            priv = os.urandom(32)
             if int.from_bytes(priv, "big") in (0, _CURVE_ORDER):
                 return None
             try:
-                pub    = coincurve.PrivateKey(priv).public_key.format(compressed=False)[1:]
-                k      = _kmod.new(digest_bits=256)
+                pub  = coincurve.PrivateKey(priv).public_key.format(compressed=False)[1:]
+                k    = _kmod.new(digest_bits=256)
                 k.update(pub)
-                addr   = "0x" + k.digest()[-20:].hex()
+                addr = "0x" + k.digest()[-20:].hex()
                 return addr, "0x" + priv.hex()
             except Exception:
                 return None
 
-        logger.info("Generator: coincurve + pycryptodome")
+        logger.info("Generator: coincurve + pycryptodome (%d workers)", NUM_WORKERS)
         return _gen
 
     except ImportError:
@@ -92,7 +95,7 @@ def _build_generator():
         from eth_account import Account
 
         def _gen() -> tuple[str, str] | None:
-            priv = secrets.token_bytes(32)
+            priv = os.urandom(32)  # FIX #4
             if int.from_bytes(priv, "big") in (0, _CURVE_ORDER):
                 return None
             try:
@@ -102,7 +105,7 @@ def _build_generator():
             except Exception:
                 return None
 
-        logger.info("Generator: eth_account")
+        logger.info("Generator: eth_account (%d workers)", NUM_WORKERS)
         return _gen
 
     except ImportError:
@@ -123,13 +126,16 @@ def _search_worker(
     mode: str,
     stop_event: threading.Event,
     shared: dict,
+    # FIX #1: lock to safely merge attempt counts from multiple workers
+    attempts_lock: threading.Lock,
 ) -> None:
     """
     Tight search loop. Runs inside run_in_executor so asyncio stays alive.
+    Multiple instances of this run in parallel (one per CPU core).
     Only writes to shared dict — never calls any asyncio functions.
     """
-    attempts = 0
-    last_report = 0
+    local_attempts = 0
+    last_report    = 0
 
     while not stop_event.is_set():
         try:
@@ -137,20 +143,22 @@ def _search_worker(
             if result is None:
                 continue
 
-            addr, key = result
-            attempts += 1
+            addr, key     = result
+            local_attempts += 1
 
-            # Report progress every REPORT_EVERY attempts
-            if attempts - last_report >= REPORT_EVERY:
-                shared["attempts"] = attempts
-                last_report = attempts
+            # FIX #1 + #3: merge local count into shared dict under lock
+            if local_attempts - last_report >= REPORT_EVERY:
+                with attempts_lock:
+                    shared["attempts"] = shared.get("attempts", 0) + (local_attempts - last_report)
+                last_report = local_attempts
 
             # Check match
             body    = addr[2:].lower()
             matched = body.startswith(pattern) if mode == "prefix" else body.endswith(pattern)
 
             if matched:
-                shared["attempts"]    = attempts
+                with attempts_lock:
+                    shared["attempts"] = shared.get("attempts", 0) + (local_attempts - last_report)
                 shared["address"]     = addr
                 shared["private_key"] = key
                 stop_event.set()
@@ -159,7 +167,10 @@ def _search_worker(
         except Exception as exc:
             logger.warning("Worker error (skipping): %s", exc)
 
-    shared["attempts"] = attempts
+    # Flush any remaining local count on exit
+    if local_attempts > last_report:
+        with attempts_lock:
+            shared["attempts"] = shared.get("attempts", 0) + (local_attempts - last_report)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -289,23 +300,29 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
     status_msg = await reply_fn(
         "🔄 *Starting vanity search…*\n\n"
         f"🎯 *Pattern:* `{esc(display)}`\n"
-        f"📊 *Expected:* \\~{esc(expected)} attempts\n\n"
-        "_Spinning up worker\\.\\.\\._"
+        f"📊 *Expected:* \\~{esc(expected)} attempts\n"
+        f"⚙️ *Workers:* {NUM_WORKERS} threads\n\n"
+        "_Spinning up workers\\.\\.\\._"
     )
 
-    stop_event = threading.Event()
-    shared     = {"attempts": 0}
-    start_time = time.monotonic()
-    loop       = asyncio.get_event_loop()
+    stop_event    = threading.Event()
+    attempts_lock = threading.Lock()          # FIX #1: shared lock for all workers
+    shared        = {"attempts": 0}
+    start_time    = time.monotonic()
+    loop          = asyncio.get_event_loop()
 
-    # Run worker in executor — asyncio stays fully responsive
-    loop.run_in_executor(
-        _executor,
-        _search_worker,
-        pattern, mode, stop_event, shared,
+    # FIX #1: launch one worker per CPU core instead of just one
+    for _ in range(NUM_WORKERS):
+        loop.run_in_executor(
+            _executor,
+            _search_worker,
+            pattern, mode, stop_event, shared, attempts_lock,
+        )
+
+    logger.info(
+        "Chat %s | search started | %s %s | %d workers",
+        chat_id, mode, pattern, NUM_WORKERS,
     )
-
-    logger.info("Chat %s | search started | %s %s", chat_id, mode, pattern)
 
     task = asyncio.create_task(
         _poll(
@@ -472,7 +489,7 @@ async def cmd_cancel(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    logger.info("Starting Vanity ETH Bot")
+    logger.info("Starting Vanity ETH Bot with %d worker threads", NUM_WORKERS)
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
