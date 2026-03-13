@@ -39,7 +39,7 @@ if not TELEGRAM_BOT_TOKEN:
 POLL_INTERVAL = 2.0
 EDIT_INTERVAL = 5.0
 EXTRACT_CHARS = 4
-NUM_WORKERS   = max(2, os.cpu_count() or 2)
+NUM_WORKERS   = 4  # cap at 4 — Railway reports many cores but more threads = more GIL contention
 
 ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
@@ -208,7 +208,7 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
     start_time   = time.monotonic()
     loop         = asyncio.get_event_loop()
 
-    logger.info("Chat %s | started | %s '%s' | %d workers", chat_id, mode, pattern, NUM_WORKERS)
+    logger.info("Chat %s | started | mode=%s pattern='%s' | %d workers", chat_id, mode, pattern, NUM_WORKERS)
 
     for i in range(NUM_WORKERS):
         loop.run_in_executor(_executor, _worker, i, pattern, mode, result_queue, stop_event)
@@ -298,6 +298,7 @@ async def handle_search_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
     async def send_status(text: str):
         return await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
 
+    # callback_data = "search:prefix:dead" → parts[1]=mode, parts[2]=pattern
     await launch_search(chat_id, parts[2], parts[1], send_status)
 
 
