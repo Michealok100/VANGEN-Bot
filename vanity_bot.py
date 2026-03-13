@@ -74,33 +74,38 @@ def _keccak256(data: bytes) -> bytes:
     return k.digest()
 
 
-def generate_address() -> tuple[str, str]:
+# secp256k1 curve order — private key must be > 0 and < this value
+_CURVE_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+def generate_address() -> tuple[str, str] | None:
     """
     Generate a random private key and derive its Ethereum address.
-    Returns (address, private_key_hex).
+    Returns (address, private_key_hex) or None if the key is invalid
+    (astronomically rare but handled safely).
 
     Steps:
     1. Generate 32 secure random bytes as private key
-    2. Use coincurve (libsecp256k1 C library) to get the public key
-    3. Strip the 0x04 uncompressed prefix → 64-byte pubkey
-    4. Keccak-256 hash the pubkey
-    5. Take the last 20 bytes → Ethereum address
+    2. Validate key is in valid secp256k1 range (> 0 and < curve order)
+    3. Use coincurve (libsecp256k1 C library) to get the public key
+    4. Strip the 0x04 uncompressed prefix → 64-byte pubkey
+    5. Keccak-256 hash the pubkey (pycryptodome C extension)
+    6. Take the last 20 bytes → Ethereum address
     """
-    # Step 1: secure random private key
     priv_bytes = secrets.token_bytes(32)
 
-    # Step 2: secp256k1 public key via coincurve (fast C library)
-    priv_key = coincurve.PrivateKey(priv_bytes)
-    pub_bytes = priv_key.public_key.format(compressed=False)[1:]  # strip 0x04
+    # Validate key range — skip if invalid (probability ~1 in 2^128)
+    priv_int = int.from_bytes(priv_bytes, "big")
+    if priv_int == 0 or priv_int >= _CURVE_ORDER:
+        return None
 
-    # Step 3: Keccak-256 of the 64-byte public key
-    digest = _keccak256(pub_bytes)
-
-    # Step 4: last 20 bytes = Ethereum address
-    address     = "0x" + digest[-20:].hex()
-    private_key = "0x" + priv_bytes.hex()
-
-    return address, private_key
+    try:
+        priv_key  = coincurve.PrivateKey(priv_bytes)
+        pub_bytes = priv_key.public_key.format(compressed=False)[1:]  # strip 0x04
+        digest    = _keccak256(pub_bytes)
+        address   = "0x" + digest[-20:].hex()
+        return address, "0x" + priv_bytes.hex()
+    except Exception:
+        return None   # skip any rare coincurve errors
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -158,19 +163,31 @@ def search_worker(
     attempts = 0
 
     while not stop_event.is_set():
-        address, private_key = generate_address()
-        attempts += 1
-        counters[worker_id] = attempts
+        try:
+            generated = generate_address()
 
-        # Check match against lowercase address body (strip 0x)
-        body = address[2:].lower()
-        matched = body.startswith(pattern) if mode == "prefix" else body.endswith(pattern)
+            # Skip invalid keys (extremely rare) without counting as attempt
+            if generated is None:
+                continue
 
-        if matched:
-            result["address"]     = address
-            result["private_key"] = private_key
-            stop_event.set()
-            return
+            address, private_key = generated
+            attempts += 1
+            counters[worker_id] = attempts
+
+            # Check match against lowercase address body (strip 0x)
+            body    = address[2:].lower()
+            matched = body.startswith(pattern) if mode == "prefix" else body.endswith(pattern)
+
+            if matched:
+                result["address"]     = address
+                result["private_key"] = private_key
+                stop_event.set()
+                return
+
+        except Exception as e:
+            # Log and continue — never let a single bad key kill the thread
+            logger.warning("Worker %d skipped error: %s", worker_id, e)
+            continue
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -276,15 +293,28 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
     counters   = [0] * NUM_WORKERS
     start_time = time.monotonic()
 
-    for wid in range(NUM_WORKERS):
+    def start_worker(wid: int) -> threading.Thread:
         t = threading.Thread(
             target=search_worker,
             args=(wid, pattern, mode, stop_event, result, counters),
             daemon=True,
         )
         t.start()
+        return t
 
+    threads = [start_worker(wid) for wid in range(NUM_WORKERS)]
     logger.info("Chat %s | %d threads | %s %s", chat_id, NUM_WORKERS, mode, pattern)
+
+    def watchdog() -> None:
+        """Restart any worker thread that dies unexpectedly."""
+        while not stop_event.is_set():
+            time.sleep(2)
+            for wid, t in enumerate(threads):
+                if not stop_event.is_set() and not t.is_alive():
+                    logger.warning("Worker %d died — restarting", wid)
+                    threads[wid] = start_worker(wid)
+
+    threading.Thread(target=watchdog, daemon=True).start()
 
     task = asyncio.create_task(
         poll_results(
