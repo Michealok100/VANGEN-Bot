@@ -49,6 +49,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 active_jobs: dict[int, dict] = {}
+result_store: dict[str, str] = {}  # short_id → value
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -121,9 +122,15 @@ async def _poll(
         # Remove from active jobs without cancelling ourselves
         active_jobs.pop(chat_id, None)
         stop_event.set()
+        # Telegram limit: callback_data max 64 bytes
+        # Store full values in result_store, use short IDs in buttons
+        addr_id = f"a{chat_id}"
+        key_id  = f"k{chat_id}"
+        result_store[addr_id] = addr
+        result_store[key_id]  = key
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 Copy Address",      callback_data=f"copy:{addr}")],
-            [InlineKeyboardButton("📋 Copy Private Key",  callback_data=f"copy:{key}")],
+            [InlineKeyboardButton("📋 Copy Address",      callback_data=f"copy:{addr_id}")],
+            [InlineKeyboardButton("📋 Copy Private Key",  callback_data=f"copy:{key_id}")],
             [InlineKeyboardButton("🔗 View on Etherscan", url=f"https://etherscan.io/address/{addr}")],
         ])
         await status_msg.edit_text(
@@ -376,8 +383,9 @@ async def handle_copy_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) 
     query = update.callback_query
     await query.answer()
     if query.data.startswith("copy:"):
-        value = query.data.split("copy:", 1)[1]
-        label = "address" if len(value) == 42 else "private key"
+        short_id = query.data.split("copy:", 1)[1]
+        value    = result_store.get(short_id, short_id)  # fallback to raw if not found
+        label    = "address" if short_id.startswith("a") else "private key"
         await query.message.reply_text(
             f"📋 *Tap and hold to copy {esc(label)}:*\n\n`{value}`",
             parse_mode=ParseMode.MARKDOWN_V2,
