@@ -1,9 +1,15 @@
 """
 vanity_bot.py — Vanity Ethereum Address Generator Telegram Bot
 ==============================================================
-Uses threading instead of multiprocessing — works on Railway and all
-cloud platforms. Each search runs worker threads that share memory
-directly, making progress tracking fast and reliable.
+Fast address generation using coincurve (secp256k1) + pycryptodome (Keccak-256).
+This bypasses the slow eth_account wrapper and generates addresses at full speed.
+
+HOW ETH ADDRESS DERIVATION WORKS:
+  1. secrets.token_bytes(32)        → secure random 32-byte private key
+  2. coincurve.PrivateKey(bytes)     → secp256k1 public key (fast C library)
+  3. public_key.format(compressed=False)[1:]  → 64-byte uncompressed pubkey
+  4. Keccak-256(pubkey)             → 32-byte hash (pycryptodome, fast C)
+  5. last 20 bytes → "0x" prefix   → Ethereum address
 """
 
 import asyncio
@@ -14,8 +20,9 @@ import secrets
 import threading
 import time
 
+import coincurve
+from Crypto.Hash import keccak as _keccak
 from dotenv import load_dotenv
-from eth_account import Account
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -40,10 +47,10 @@ if not TELEGRAM_BOT_TOKEN:
     )
 
 # ── Config ────────────────────────────────────────────────────────────────────
-NUM_WORKERS   = max(2, (os.cpu_count() or 2))   # threads — more is fine
-POLL_INTERVAL = 1.5     # seconds between asyncio queue checks
-EDIT_INTERVAL = 3.0     # seconds between Telegram message edits
-EXTRACT_CHARS = 4       # chars to auto-extract from pasted address
+NUM_WORKERS   = max(2, (os.cpu_count() or 2))
+POLL_INTERVAL = 1.5
+EDIT_INTERVAL = 3.0
+EXTRACT_CHARS = 4
 
 ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
@@ -53,8 +60,47 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# chat_id → job dict
 active_jobs: dict[int, dict] = {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FAST ADDRESS DERIVATION  (coincurve + pycryptodome)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _keccak256(data: bytes) -> bytes:
+    """Fast Keccak-256 via pycryptodome C extension."""
+    k = _keccak.new(digest_bits=256)
+    k.update(data)
+    return k.digest()
+
+
+def generate_address() -> tuple[str, str]:
+    """
+    Generate a random private key and derive its Ethereum address.
+    Returns (address, private_key_hex).
+
+    Steps:
+    1. Generate 32 secure random bytes as private key
+    2. Use coincurve (libsecp256k1 C library) to get the public key
+    3. Strip the 0x04 uncompressed prefix → 64-byte pubkey
+    4. Keccak-256 hash the pubkey
+    5. Take the last 20 bytes → Ethereum address
+    """
+    # Step 1: secure random private key
+    priv_bytes = secrets.token_bytes(32)
+
+    # Step 2: secp256k1 public key via coincurve (fast C library)
+    priv_key = coincurve.PrivateKey(priv_bytes)
+    pub_bytes = priv_key.public_key.format(compressed=False)[1:]  # strip 0x04
+
+    # Step 3: Keccak-256 of the 64-byte public key
+    digest = _keccak256(pub_bytes)
+
+    # Step 4: last 20 bytes = Ethereum address
+    address     = "0x" + digest[-20:].hex()
+    private_key = "0x" + priv_bytes.hex()
+
+    return address, private_key
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -62,13 +108,11 @@ active_jobs: dict[int, dict] = {}
 # ══════════════════════════════════════════════════════════════════════════════
 
 def esc(text: str) -> str:
-    """Escape string for Telegram MarkdownV2."""
     specials = r"\_*[]()~`>#+-=|{}.!"
     return "".join(f"\\{c}" if c in specials else c for c in text)
 
 
 def extract_patterns(address: str) -> tuple[str, str]:
-    """Extract first/last EXTRACT_CHARS hex chars from an ETH address."""
     body = address[2:].lower()
     return body[:EXTRACT_CHARS], body[-EXTRACT_CHARS:]
 
@@ -85,20 +129,17 @@ def estimate_attempts(n: int) -> str:
 
 
 def kill_job(chat_id: int) -> None:
-    """Stop all threads and cancel the asyncio task for a chat."""
     job = active_jobs.pop(chat_id, None)
     if not job:
         return
-    # Signal threads to stop
     job["stop_event"].set()
-    # Cancel asyncio polling task
     task = job.get("task")
     if task and not task.done():
         task.cancel()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  WORKER THREAD  (runs in background thread, not a separate process)
+#  WORKER THREAD
 # ══════════════════════════════════════════════════════════════════════════════
 
 def search_worker(
@@ -106,42 +147,28 @@ def search_worker(
     pattern: str,
     mode: str,
     stop_event: threading.Event,
-    result: dict,           # shared dict — workers write result here
-    counters: list,         # counters[worker_id] = attempt count
+    result: dict,
+    counters: list,
 ) -> None:
     """
-    Thread worker. Generates random private keys, derives ETH addresses,
-    checks for match. Writes result to shared dict and sets stop_event on find.
-
-    HOW ETH ADDRESS IS DERIVED:
-    1. secrets.token_bytes(32)  → secure random 32-byte private key
-    2. Account.from_key()       → secp256k1 curve + Keccak-256 hash internally
-    3. account.address          → last 20 bytes of hash, prefixed with 0x
+    Thread worker — generates addresses at maximum speed using
+    coincurve + pycryptodome C extensions. Updates counters[worker_id]
+    on every attempt so the progress display is always accurate.
     """
     attempts = 0
 
     while not stop_event.is_set():
-        # Generate secure random private key
-        private_key_hex = "0x" + secrets.token_bytes(32).hex()
-
-        # Derive Ethereum address
-        account = Account.from_key(private_key_hex)
-        address = account.address
-
+        address, private_key = generate_address()
         attempts += 1
-        counters[worker_id] = attempts   # update shared counter
+        counters[worker_id] = attempts
 
-        # Check match
+        # Check match against lowercase address body (strip 0x)
         body = address[2:].lower()
-        matched = (
-            body.startswith(pattern) if mode == "prefix"
-            else body.endswith(pattern)
-        )
+        matched = body.startswith(pattern) if mode == "prefix" else body.endswith(pattern)
 
         if matched:
-            # Write result and signal all threads to stop
             result["address"]     = address
-            result["private_key"] = private_key_hex
+            result["private_key"] = private_key
             stop_event.set()
             return
 
@@ -160,10 +187,6 @@ async def poll_results(
     counters: list,
     start_time: float,
 ) -> None:
-    """
-    Asyncio task that monitors worker threads and updates the Telegram message.
-    Runs until a match is found or cancelled.
-    """
     last_edit = time.monotonic()
     display   = f"0x{pattern}..." if mode == "prefix" else f"0x...{pattern}"
 
@@ -186,7 +209,6 @@ async def poll_results(
                     [InlineKeyboardButton("📋 Copy Private Key",  callback_data=f"copy:{private_key}")],
                     [InlineKeyboardButton("🔗 View on Etherscan", url=f"https://etherscan.io/address/{address}")],
                 ])
-
                 await status_message.edit_text(
                     "✅ *Vanity Address Found\\!*\n\n"
                     f"🎯 *Pattern:* `{esc(display)}`\n\n"
@@ -234,7 +256,6 @@ async def poll_results(
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None:
-    """Kill any existing job, spawn worker threads, start polling task."""
     if chat_id in active_jobs:
         kill_job(chat_id)
         await asyncio.sleep(0.2)
@@ -251,12 +272,10 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
     )
 
     stop_event = threading.Event()
-    result     = {}                          # shared dict for found address
-    counters   = [0] * NUM_WORKERS           # per-thread attempt counter
+    result     = {}
+    counters   = [0] * NUM_WORKERS
     start_time = time.monotonic()
 
-    # Spawn worker threads
-    threads = []
     for wid in range(NUM_WORKERS):
         t = threading.Thread(
             target=search_worker,
@@ -264,7 +283,6 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
             daemon=True,
         )
         t.start()
-        threads.append(t)
 
     logger.info("Chat %s | %d threads | %s %s", chat_id, NUM_WORKERS, mode, pattern)
 
@@ -282,7 +300,6 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
     )
 
     active_jobs[chat_id] = {
-        "threads":    threads,
         "stop_event": stop_event,
         "task":       task,
         "counters":   counters,
@@ -293,7 +310,7 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  COMMAND & MESSAGE HANDLERS
+#  HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -315,15 +332,13 @@ async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_address_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """User pastes ETH address — extract prefix/suffix and show choice buttons."""
     text = update.message.text.strip()
 
     if not ETH_ADDRESS_RE.match(text):
         await update.message.reply_text(
             "⚠️ That doesn't look like a valid Ethereum address\\.\n\n"
             "Please paste a full 42\\-character address starting with `0x`\\.\n\n"
-            "_Example:_\n"
-            "`0xDeaD1234567890AbCd1234567890abcdEF123456`",
+            "_Example:_\n`0xDeaD1234567890AbCd1234567890abcdEF123456`",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
         return
@@ -331,14 +346,8 @@ async def handle_address_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
     prefix, suffix = extract_patterns(text)
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"🔵 Match Prefix → 0x{prefix}…",
-            callback_data=f"search:prefix:{prefix}",
-        )],
-        [InlineKeyboardButton(
-            f"🟣 Match Suffix → 0x…{suffix}",
-            callback_data=f"search:suffix:{suffix}",
-        )],
+        [InlineKeyboardButton(f"🔵 Match Prefix → 0x{prefix}…", callback_data=f"search:prefix:{prefix}")],
+        [InlineKeyboardButton(f"🟣 Match Suffix → 0x…{suffix}", callback_data=f"search:suffix:{suffix}")],
     ])
 
     await update.message.reply_text(
@@ -355,11 +364,9 @@ async def handle_address_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
 
 
 async def handle_search_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Match Prefix / Match Suffix button taps."""
     query   = update.callback_query
     chat_id = query.message.chat_id
     await query.answer()
-
     parts   = query.data.split(":", 2)
     mode    = parts[1]
     pattern = parts[2]
@@ -371,14 +378,13 @@ async def handle_search_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
 
 
 async def handle_refresh_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Refresh Progress button — pull latest stats instantly."""
     query   = update.callback_query
     chat_id = int(query.data.split(":")[1])
     await query.answer("Refreshed!")
 
     job = active_jobs.get(chat_id)
     if not job:
-        await query.message.reply_text("No active search. It may have already completed.")
+        await query.message.reply_text("No active search found. It may have already completed.")
         return
 
     total   = sum(job["counters"])
@@ -392,7 +398,6 @@ async def handle_refresh_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("🔄 Refresh Progress", callback_data=f"refresh:{chat_id}")],
         [InlineKeyboardButton("🛑 Cancel Search",    callback_data=f"canceljob:{chat_id}")],
     ])
-
     try:
         await query.message.edit_text(
             "🔄 *Searching for vanity address…*\n\n"
@@ -409,14 +414,11 @@ async def handle_refresh_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYP
 
 
 async def handle_cancelJob_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Cancel Search inline button."""
     query   = update.callback_query
     chat_id = int(query.data.split(":")[1])
     await query.answer("Cancelled!")
-
     if chat_id in active_jobs:
         kill_job(chat_id)
-
     try:
         await query.message.edit_text(
             "🛑 *Search cancelled\\.*\n\n"
@@ -428,10 +430,8 @@ async def handle_cancelJob_callback(update: Update, _ctx: ContextTypes.DEFAULT_T
 
 
 async def handle_copy_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Copy Address / Copy Private Key button taps."""
     query = update.callback_query
     await query.answer()
-
     if query.data and query.data.startswith("copy:"):
         value = query.data.split("copy:", 1)[1]
         label = "address" if len(value) == 42 else "private key"
@@ -444,14 +444,10 @@ async def handle_copy_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) 
 async def cmd_cancel(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     if chat_id not in active_jobs:
-        await update.message.reply_text(
-            "No active search to cancel.\n\nPaste an Ethereum address to start."
-        )
+        await update.message.reply_text("No active search to cancel.\n\nPaste an Ethereum address to start.")
         return
     kill_job(chat_id)
-    await update.message.reply_text(
-        "🛑 Search cancelled.\n\nPaste an Ethereum address to start a new search."
-    )
+    await update.message.reply_text("🛑 Search cancelled.\n\nPaste an Ethereum address to start a new search.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
