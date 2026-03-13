@@ -1,26 +1,21 @@
 """
 vanity_bot.py — Vanity Ethereum Address Generator Telegram Bot
 ==============================================================
-New smart flow:
-  User pastes any Ethereum address → bot extracts the first 4 and last 4
-  characters automatically and asks which they want to match.
-
-Commands:
-  /start   — welcome + usage guide
-  /cancel  — cancel an in-progress search
-
-Also handles plain text messages that look like Ethereum addresses.
+Uses threading instead of multiprocessing — works on Railway and all
+cloud platforms. Each search runs worker threads that share memory
+directly, making progress tracking fast and reliable.
 """
 
 import asyncio
 import logging
-import multiprocessing
 import os
 import re
+import secrets
+import threading
 import time
-from multiprocessing import Queue, Value
 
 from dotenv import load_dotenv
+from eth_account import Account
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -31,8 +26,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-
-from vanity_worker import worker
 
 # ── Environment ───────────────────────────────────────────────────────────────
 load_dotenv()
@@ -47,10 +40,10 @@ if not TELEGRAM_BOT_TOKEN:
     )
 
 # ── Config ────────────────────────────────────────────────────────────────────
-NUM_WORKERS   = max(1, (os.cpu_count() or 2) - 1)
-POLL_INTERVAL = 1.5
-EDIT_INTERVAL = 3.0
-EXTRACT_CHARS = 4   # chars to extract as prefix/suffix from pasted address
+NUM_WORKERS   = max(2, (os.cpu_count() or 2))   # threads — more is fine
+POLL_INTERVAL = 1.5     # seconds between asyncio queue checks
+EDIT_INTERVAL = 3.0     # seconds between Telegram message edits
+EXTRACT_CHARS = 4       # chars to auto-extract from pasted address
 
 ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
@@ -60,6 +53,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# chat_id → job dict
 active_jobs: dict[int, dict] = {}
 
 
@@ -68,12 +62,13 @@ active_jobs: dict[int, dict] = {}
 # ══════════════════════════════════════════════════════════════════════════════
 
 def esc(text: str) -> str:
+    """Escape string for Telegram MarkdownV2."""
     specials = r"\_*[]()~`>#+-=|{}.!"
     return "".join(f"\\{c}" if c in specials else c for c in text)
 
 
 def extract_patterns(address: str) -> tuple[str, str]:
-    """Return (prefix, suffix) — each EXTRACT_CHARS hex chars, lowercased."""
+    """Extract first/last EXTRACT_CHARS hex chars from an ETH address."""
     body = address[2:].lower()
     return body[:EXTRACT_CHARS], body[-EXTRACT_CHARS:]
 
@@ -90,26 +85,69 @@ def estimate_attempts(n: int) -> str:
 
 
 def kill_job(chat_id: int) -> None:
+    """Stop all threads and cancel the asyncio task for a chat."""
     job = active_jobs.pop(chat_id, None)
     if not job:
         return
-    try:
-        job["stop_flag"].value = 1
-    except Exception:
-        pass
-    for p in job.get("processes", []):
-        try:
-            p.terminate()
-            p.join(timeout=1)
-        except Exception:
-            pass
+    # Signal threads to stop
+    job["stop_event"].set()
+    # Cancel asyncio polling task
     task = job.get("task")
     if task and not task.done():
         task.cancel()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  BACKGROUND POLLING TASK
+#  WORKER THREAD  (runs in background thread, not a separate process)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def search_worker(
+    worker_id: int,
+    pattern: str,
+    mode: str,
+    stop_event: threading.Event,
+    result: dict,           # shared dict — workers write result here
+    counters: list,         # counters[worker_id] = attempt count
+) -> None:
+    """
+    Thread worker. Generates random private keys, derives ETH addresses,
+    checks for match. Writes result to shared dict and sets stop_event on find.
+
+    HOW ETH ADDRESS IS DERIVED:
+    1. secrets.token_bytes(32)  → secure random 32-byte private key
+    2. Account.from_key()       → secp256k1 curve + Keccak-256 hash internally
+    3. account.address          → last 20 bytes of hash, prefixed with 0x
+    """
+    attempts = 0
+
+    while not stop_event.is_set():
+        # Generate secure random private key
+        private_key_hex = "0x" + secrets.token_bytes(32).hex()
+
+        # Derive Ethereum address
+        account = Account.from_key(private_key_hex)
+        address = account.address
+
+        attempts += 1
+        counters[worker_id] = attempts   # update shared counter
+
+        # Check match
+        body = address[2:].lower()
+        matched = (
+            body.startswith(pattern) if mode == "prefix"
+            else body.endswith(pattern)
+        )
+
+        if matched:
+            # Write result and signal all threads to stop
+            result["address"]     = address
+            result["private_key"] = private_key_hex
+            stop_event.set()
+            return
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BACKGROUND ASYNCIO POLLING TASK
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def poll_results(
@@ -117,43 +155,38 @@ async def poll_results(
     status_message,
     pattern: str,
     mode: str,
-    result_queue: Queue,
-    worker_attempts: dict,
+    stop_event: threading.Event,
+    result: dict,
+    counters: list,
     start_time: float,
 ) -> None:
+    """
+    Asyncio task that monitors worker threads and updates the Telegram message.
+    Runs until a match is found or cancelled.
+    """
     last_edit = time.monotonic()
-    found     = None
+    display   = f"0x{pattern}..." if mode == "prefix" else f"0x...{pattern}"
 
     try:
         while True:
             await asyncio.sleep(POLL_INTERVAL)
 
-            while not result_queue.empty():
-                try:
-                    msg = result_queue.get_nowait()
-                except Exception:
-                    break
-                if msg[0] == "progress":
-                    _, wid, attempts = msg
-                    worker_attempts[wid] = attempts
-                elif msg[0] == "found":
-                    _, wid, attempts, address, private_key = msg
-                    worker_attempts[wid] = attempts
-                    found = (address, private_key)
-
-            total   = sum(worker_attempts.values())
+            total   = sum(counters)
             elapsed = time.monotonic() - start_time
             rate    = int(total / elapsed) if elapsed > 0 else 0
 
-            if found:
-                address, private_key = found
+            # ── Match found ───────────────────────────────────────────────────
+            if stop_event.is_set() and result.get("address"):
+                address     = result["address"]
+                private_key = result["private_key"]
                 kill_job(chat_id)
-                display  = f"0x{pattern}..." if mode == "prefix" else f"0x...{pattern}"
+
                 keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📋 Copy Address",     callback_data=f"copy:{address}")],
-                    [InlineKeyboardButton("📋 Copy Private Key", callback_data=f"copy:{private_key}")],
+                    [InlineKeyboardButton("📋 Copy Address",      callback_data=f"copy:{address}")],
+                    [InlineKeyboardButton("📋 Copy Private Key",  callback_data=f"copy:{private_key}")],
                     [InlineKeyboardButton("🔗 View on Etherscan", url=f"https://etherscan.io/address/{address}")],
                 ])
+
                 await status_message.edit_text(
                     "✅ *Vanity Address Found\\!*\n\n"
                     f"🎯 *Pattern:* `{esc(display)}`\n\n"
@@ -169,22 +202,22 @@ async def poll_results(
                 )
                 return
 
+            # ── Periodic progress update ──────────────────────────────────────
             now = time.monotonic()
             if now - last_edit >= EDIT_INTERVAL:
                 last_edit = now
-                display   = f"0x{pattern}..." if mode == "prefix" else f"0x...{pattern}"
+                refresh_kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Refresh Progress", callback_data=f"refresh:{chat_id}")],
+                    [InlineKeyboardButton("🛑 Cancel Search",    callback_data=f"canceljob:{chat_id}")],
+                ])
                 try:
-                    refresh_kb = InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Refresh Progress", callback_data=f"refresh:{chat_id}")],
-                        [InlineKeyboardButton("🛑 Cancel Search",    callback_data=f"canceljob:{chat_id}")],
-                    ])
                     await status_message.edit_text(
                         "🔄 *Searching for vanity address…*\n\n"
                         f"🎯 *Pattern:* `{esc(display)}`\n\n"
                         f"🔁 Attempts: *{esc(f'{total:,}')}*\n"
                         f"⚡ Speed: *{esc(f'{rate:,}')}* addr/s\n"
                         f"⏱ Elapsed: *{esc(f'{elapsed:.0f}s')}*\n\n"
-                        "_Tap Refresh to update stats\._",
+                        "_Tap Refresh to update stats\\._",
                         parse_mode=ParseMode.MARKDOWN_V2,
                         reply_markup=refresh_kb,
                     )
@@ -201,6 +234,7 @@ async def poll_results(
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None:
+    """Kill any existing job, spawn worker threads, start polling task."""
     if chat_id in active_jobs:
         kill_job(chat_id)
         await asyncio.sleep(0.2)
@@ -216,22 +250,23 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
         "_Spinning up workers\\.\\.\\._"
     )
 
-    result_queue: Queue = multiprocessing.Queue()
-    stop_flag           = multiprocessing.Value("b", 0)
-    processes           = []
-    worker_attempts     = {i: 0 for i in range(NUM_WORKERS)}
-    start_time          = time.monotonic()
+    stop_event = threading.Event()
+    result     = {}                          # shared dict for found address
+    counters   = [0] * NUM_WORKERS           # per-thread attempt counter
+    start_time = time.monotonic()
 
+    # Spawn worker threads
+    threads = []
     for wid in range(NUM_WORKERS):
-        p = multiprocessing.Process(
-            target=worker,
-            args=(wid, pattern, mode, result_queue, stop_flag),
+        t = threading.Thread(
+            target=search_worker,
+            args=(wid, pattern, mode, stop_event, result, counters),
             daemon=True,
         )
-        p.start()
-        processes.append(p)
+        t.start()
+        threads.append(t)
 
-    logger.info("Chat %s | %d workers | %s %s", chat_id, NUM_WORKERS, mode, pattern)
+    logger.info("Chat %s | %d threads | %s %s", chat_id, NUM_WORKERS, mode, pattern)
 
     task = asyncio.create_task(
         poll_results(
@@ -239,25 +274,26 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
             status_message=status_msg,
             pattern=pattern,
             mode=mode,
-            result_queue=result_queue,
-            worker_attempts=worker_attempts,
+            stop_event=stop_event,
+            result=result,
+            counters=counters,
             start_time=start_time,
         )
     )
 
     active_jobs[chat_id] = {
-        "processes":      processes,
-        "stop_flag":      stop_flag,
-        "task":           task,
-        "worker_attempts": worker_attempts,
-        "start_time":     start_time,
-        "pattern":        pattern,
-        "mode":           mode,
+        "threads":    threads,
+        "stop_event": stop_event,
+        "task":       task,
+        "counters":   counters,
+        "start_time": start_time,
+        "pattern":    pattern,
+        "mode":       mode,
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  HANDLERS
+#  COMMAND & MESSAGE HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -274,15 +310,12 @@ async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "5 chars = ~1M attempts (1-2 min)\n"
         "6 chars = ~16M attempts (30-60 min)\n\n"
         "Each extra character is 16x harder.\n\n"
-        "Use /cancel to stop any active search.",
+        "Use /cancel to stop any active search."
     )
 
 
 async def handle_address_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    User pastes an Ethereum address as a plain message.
-    Extract prefix + suffix and show choice buttons.
-    """
+    """User pastes ETH address — extract prefix/suffix and show choice buttons."""
     text = update.message.text.strip()
 
     if not ETH_ADDRESS_RE.match(text):
@@ -327,10 +360,9 @@ async def handle_search_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
     chat_id = query.message.chat_id
     await query.answer()
 
-    # callback_data format: "search:prefix:dead" or "search:suffix:cafe"
     parts   = query.data.split(":", 2)
-    mode    = parts[1]   # "prefix" or "suffix"
-    pattern = parts[2]   # e.g. "dead"
+    mode    = parts[1]
+    pattern = parts[2]
 
     async def send_status(text: str):
         return await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
@@ -338,8 +370,65 @@ async def handle_search_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
     await launch_search(chat_id, pattern, mode, send_status)
 
 
+async def handle_refresh_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Refresh Progress button — pull latest stats instantly."""
+    query   = update.callback_query
+    chat_id = int(query.data.split(":")[1])
+    await query.answer("Refreshed!")
+
+    job = active_jobs.get(chat_id)
+    if not job:
+        await query.message.reply_text("No active search. It may have already completed.")
+        return
+
+    total   = sum(job["counters"])
+    elapsed = time.monotonic() - job["start_time"]
+    rate    = int(total / elapsed) if elapsed > 0 else 0
+    pattern = job["pattern"]
+    mode    = job["mode"]
+    display = f"0x{pattern}..." if mode == "prefix" else f"0x...{pattern}"
+
+    refresh_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh Progress", callback_data=f"refresh:{chat_id}")],
+        [InlineKeyboardButton("🛑 Cancel Search",    callback_data=f"canceljob:{chat_id}")],
+    ])
+
+    try:
+        await query.message.edit_text(
+            "🔄 *Searching for vanity address…*\n\n"
+            f"🎯 *Pattern:* `{esc(display)}`\n\n"
+            f"🔁 Attempts: *{esc(f'{total:,}')}*\n"
+            f"⚡ Speed: *{esc(f'{rate:,}')}* addr/s\n"
+            f"⏱ Elapsed: *{esc(f'{elapsed:.0f}s')}*\n\n"
+            "_Tap Refresh to update stats\\._",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=refresh_kb,
+        )
+    except Exception:
+        pass
+
+
+async def handle_cancelJob_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Cancel Search inline button."""
+    query   = update.callback_query
+    chat_id = int(query.data.split(":")[1])
+    await query.answer("Cancelled!")
+
+    if chat_id in active_jobs:
+        kill_job(chat_id)
+
+    try:
+        await query.message.edit_text(
+            "🛑 *Search cancelled\\.*\n\n"
+            "_Paste an Ethereum address to start a new search\\._",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    except Exception:
+        pass
+
+
 async def handle_copy_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle 📋 Copy Address / Copy Private Key button taps."""
+    """Handle Copy Address / Copy Private Key button taps."""
     query = update.callback_query
     await query.answer()
 
@@ -356,77 +445,13 @@ async def cmd_cancel(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     if chat_id not in active_jobs:
         await update.message.reply_text(
-            "ℹ️ No active search to cancel\\.\n\n"
-            "_Paste an Ethereum address to start a new search\\._",
-            parse_mode=ParseMode.MARKDOWN_V2,
+            "No active search to cancel.\n\nPaste an Ethereum address to start."
         )
         return
     kill_job(chat_id)
     await update.message.reply_text(
-        "🛑 *Search cancelled\\.*\n\n"
-        "_Paste an Ethereum address to start a new search\\._",
-        parse_mode=ParseMode.MARKDOWN_V2,
+        "🛑 Search cancelled.\n\nPaste an Ethereum address to start a new search."
     )
-
-
-async def handle_refresh_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the Refresh Progress button — instantly shows latest stats."""
-    query   = update.callback_query
-    chat_id = int(query.data.split(":")[1])
-    await query.answer("Refreshed!")
-
-    job = active_jobs.get(chat_id)
-    if not job:
-        await query.message.reply_text("No active search found. It may have already completed.")
-        return
-
-    worker_attempts = job["worker_attempts"]
-    start_time      = job["start_time"]
-    pattern         = job["pattern"]
-    mode            = job["mode"]
-
-    total   = sum(worker_attempts.values())
-    elapsed = time.monotonic() - start_time
-    rate    = int(total / elapsed) if elapsed > 0 else 0
-    display = f"0x{pattern}..." if mode == "prefix" else f"0x...{pattern}"
-
-    refresh_kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Refresh Progress", callback_data=f"refresh:{chat_id}")],
-        [InlineKeyboardButton("🛑 Cancel Search",    callback_data=f"canceljob:{chat_id}")],
-    ])
-
-    try:
-        await query.message.edit_text(
-            "🔄 *Searching for vanity address…*\n\n"
-            f"🎯 *Pattern:* `{esc(display)}`\n\n"
-            f"🔁 Attempts: *{esc(f'{total:,}')}*\n"
-            f"⚡ Speed: *{esc(f'{rate:,}')}* addr/s\n"
-            f"⏱ Elapsed: *{esc(f'{elapsed:.0f}s')}*\n\n"
-            "_Tap Refresh to update stats\._",
-            parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=refresh_kb,
-        )
-    except Exception:
-        pass
-
-
-async def handle_cancelJob_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the Cancel Search inline button."""
-    query   = update.callback_query
-    chat_id = int(query.data.split(":")[1])
-    await query.answer("Cancelled!")
-
-    if chat_id in active_jobs:
-        kill_job(chat_id)
-
-    try:
-        await query.message.edit_text(
-            "🛑 *Search cancelled\.*\n\n"
-            "_Paste an Ethereum address to start a new search\._",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-    except Exception:
-        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -434,19 +459,18 @@ async def handle_cancelJob_callback(update: Update, _ctx: ContextTypes.DEFAULT_T
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    logger.info("Starting Vanity ETH Bot | %d workers", NUM_WORKERS)
+    logger.info("Starting Vanity ETH Bot | %d threads per search", NUM_WORKERS)
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
-    app.add_handler(CallbackQueryHandler(handle_search_callback, pattern=r"^search:"))
+    app.add_handler(CallbackQueryHandler(handle_search_callback,    pattern=r"^search:"))
     app.add_handler(CallbackQueryHandler(handle_copy_callback,      pattern=r"^copy:"))
     app.add_handler(CallbackQueryHandler(handle_refresh_callback,   pattern=r"^refresh:"))
     app.add_handler(CallbackQueryHandler(handle_cancelJob_callback, pattern=r"^canceljob:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_address_message))
 
-    # Global error handler — logs any unhandled exceptions so they appear in Railway logs
     async def error_handler(update, context):
         logger.error("Unhandled exception: %s", context.error, exc_info=context.error)
 
@@ -457,5 +481,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    multiprocessing.freeze_support()
     main()
