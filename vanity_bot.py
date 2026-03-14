@@ -112,7 +112,7 @@ async def _poll(
     start_time: float,
 ) -> None:
     last_edit = time.monotonic()
-    display   = f"0x{prefix}…{suffix}"
+    display   = f"0x{prefix}...{suffix}"
     total     = 0
 
     async def send_found(addr: str, key: str) -> None:
@@ -200,8 +200,8 @@ async def _poll(
                         parse_mode=ParseMode.MARKDOWN_V2,
                         reply_markup=kb,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("Poll edit failed: %s", e)
 
     except asyncio.CancelledError:
         # Final drain — result might already be sitting in the queue
@@ -213,8 +213,8 @@ async def _poll(
                     total += attempts
                     await send_found(addr, key)
                     return
-        except Exception:
-            pass
+        except Exception as e:
+                    logger.warning("Poll cancelled drain failed: %s", e)
         logger.info("Poll cancelled for chat %s", chat_id)
         raise
 
@@ -228,7 +228,7 @@ async def launch_search(chat_id: int, prefix: str, suffix: str, reply_fn) -> Non
         kill_job(chat_id)
         await asyncio.sleep(0.3)
 
-    display  = f"0x{prefix}…{suffix}"
+    display  = f"0x{prefix}\\.\\.\\.{suffix}"
     expected = estimate_attempts(len(prefix) + len(suffix))
 
     status_msg = await reply_fn(
@@ -309,7 +309,7 @@ async def handle_address_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
     prefix, suffix = extract_patterns(text)
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🎯 Search  0x{prefix}…{suffix}", callback_data=f"search:{prefix}:{suffix}")],
+        [InlineKeyboardButton(f"🎯 Search  0x{prefix}...{suffix}", callback_data=f"search:{prefix}:{suffix}")],
     ])
 
     await update.message.reply_text(
@@ -317,9 +317,9 @@ async def handle_address_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
         f"`{esc(text)}`\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "Extracted patterns:\n\n"
-        f"🔵 *Prefix \\(first 3\\):* `0x{esc(prefix)}…`\n"
-        f"🟣 *Suffix \\(last 3\\):* `0x…{esc(suffix)}`\n\n"
-        f"🎯 *Combined:* `0x{esc(prefix)}…{esc(suffix)}`\n\n"
+        f"🔵 *Prefix \\(first 3\\):* `0x{esc(prefix)}...`\n"
+        f"🟣 *Suffix \\(last 3\\):* `0x...{esc(suffix)}`\n\n"
+        f"🎯 *Combined:* `0x{esc(prefix)}...{esc(suffix)}`\n\n"
         "💡 _Searches for an address matching both at once\\._\n\n"
         "👇 *Tap to start searching:*",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -372,7 +372,7 @@ async def handle_refresh_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYP
     total   = job.get("total", 0) + sum(i[2] for i in items if i[0] == "progress")
     job["total"] = total
     rate    = int(total / elapsed) if elapsed > 0 else 0
-    display = f"0x{job['prefix']}…{job['suffix']}"
+    display = f"0x{job['prefix']}...{job['suffix']}"
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{chat_id}")],
