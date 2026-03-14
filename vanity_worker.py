@@ -14,7 +14,7 @@ import os
 import threading
 from queue import Queue
 
-REPORT_EVERY = 1_000
+REPORT_EVERY = 10_000
 
 
 # ── Pick fastest available library ───────────────────────────────────────────
@@ -84,18 +84,20 @@ def worker(
     result_queue: Queue,
     stop_event: threading.Event,
 ) -> None:
-    attempts = 0
+    attempts  = 0
+    prefix_len = len(prefix)
+    suffix_len = len(suffix)
 
     while not stop_event.is_set():
-        address, private_key_hex = _generate()
-        attempts += 1
+        # Process in batches to reduce stop_event check overhead
+        for _ in range(REPORT_EVERY):
+            address, private_key_hex = _generate()
+            body = address[2:].lower()
+            if body[:prefix_len] == prefix and body[-suffix_len:] == suffix:
+                result_queue.put(("found", worker_id, attempts, address, private_key_hex))
+                stop_event.set()
+                return
+        attempts += REPORT_EVERY
+        result_queue.put(("progress", worker_id, REPORT_EVERY))
 
-        if _matches(address, prefix, suffix):
-            result_queue.put(("found", worker_id, attempts, address, private_key_hex))
-            stop_event.set()
-            return
-
-        if attempts % REPORT_EVERY == 0:
-            result_queue.put(("progress", worker_id, attempts))
-
-    result_queue.put(("progress", worker_id, attempts))
+    result_queue.put(("progress", worker_id, attempts % REPORT_EVERY))
