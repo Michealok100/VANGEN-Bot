@@ -70,17 +70,17 @@ _generate = _build_generator()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _matches(address: str, pattern: str, mode: str) -> bool:
+def _matches(address: str, prefix: str, suffix: str) -> bool:
     body = address[2:].lower()
-    return body.startswith(pattern) if mode == "prefix" else body.endswith(pattern)
+    return body.startswith(prefix) and body.endswith(suffix)
 
 
 # ── Worker function (runs in a thread) ───────────────────────────────────────
 
 def worker(
     worker_id: int,
-    pattern: str,
-    mode: str,
+    prefix: str,
+    suffix: str,
     result_queue: Queue,
     stop_event: threading.Event,
 ) -> None:
@@ -90,7 +90,7 @@ def worker(
         address, private_key_hex = _generate()
         attempts += 1
 
-        if _matches(address, pattern, mode):
+        if _matches(address, prefix, suffix):
             result_queue.put(("found", worker_id, attempts, address, private_key_hex))
             stop_event.set()
             return
