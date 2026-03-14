@@ -37,7 +37,7 @@ if not TELEGRAM_BOT_TOKEN:
 POLL_INTERVAL  = 0.5    # check queue every 0.5s so fast results aren't missed
 EDIT_INTERVAL  = 5.0    # seconds between Telegram message edits
 EXTRACT_CHARS  = 3      # 3-char prefix + 3-char suffix matched simultaneously
-NUM_WORKERS    = 8      # 8 workers — needed for combined prefix+suffix searches
+NUM_WORKERS    = 16     # 16 workers for faster 3+3 searches
 
 ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _executor      = ThreadPoolExecutor(max_workers=NUM_WORKERS)
