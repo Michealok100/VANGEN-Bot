@@ -22,26 +22,6 @@ REPORT_EVERY = 1_000
 def _build_generator():
     try:
         from coincurve import PublicKey
-        from sha3 import keccak_256
-
-        def _gen():
-            while True:
-                priv = os.urandom(32)
-                try:
-                    pub  = PublicKey.from_valid_secret(priv).format(compressed=False)[1:]
-                    addr = "0x" + keccak_256(pub).digest()[-20:].hex()
-                    return addr, "0x" + priv.hex()
-                except Exception:
-                    continue
-
-        print("[vanity_worker] Generator: coincurve + pysha3 ✓ (fast)", flush=True)
-        return _gen
-
-    except ImportError:
-        pass
-
-    try:
-        from coincurve import PublicKey
         from Crypto.Hash import keccak as _kmod
 
         def _gen():
@@ -56,7 +36,7 @@ def _build_generator():
                 except Exception:
                     continue
 
-        print("[vanity_worker] Generator: coincurve + pycryptodome (medium)", flush=True)
+        print("[vanity_worker] Generator: coincurve + pycryptodome ✓ (fast)", flush=True)
         return _gen
 
     except ImportError:
@@ -76,13 +56,13 @@ def _build_generator():
                 except Exception:
                     continue
 
-        print("[vanity_worker] ⚠ Generator: eth_account (SLOW). Add pysha3 to requirements.txt", flush=True)
+        print("[vanity_worker] ⚠ Generator: eth_account (SLOW). Add coincurve + pycryptodome to requirements.txt", flush=True)
         return _gen
 
     except ImportError:
         pass
 
-    raise RuntimeError("No crypto library found. Add coincurve and pysha3 to requirements.txt")
+    raise RuntimeError("No crypto library found. Add coincurve and pycryptodome to requirements.txt")
 
 
 _generate = _build_generator()
