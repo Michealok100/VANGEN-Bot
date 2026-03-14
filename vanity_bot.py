@@ -334,6 +334,8 @@ async def handle_search_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
     # callback_data = "search:abc:f9e" → parts[1]=prefix, parts[2]=suffix
     _, prefix, suffix = query.data.split(":", 2)
 
+    logger.info("DEBUG search: prefix='%s' suffix='%s' raw_data='%s'", prefix, suffix, query.data)
+
     async def send_status(text: str):
         return await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
 
