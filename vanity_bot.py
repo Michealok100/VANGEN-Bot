@@ -36,7 +36,7 @@ if not TELEGRAM_BOT_TOKEN:
 # ── Config ────────────────────────────────────────────────────────────────────
 POLL_INTERVAL  = 0.5    # check queue every 0.5s so fast results aren't missed
 EDIT_INTERVAL  = 5.0    # seconds between Telegram message edits
-EXTRACT_CHARS  = 4
+EXTRACT_CHARS  = 6
 NUM_WORKERS    = 4      # fixed at 4 — Railway has many cores but 4 is optimal
 
 ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -116,7 +116,7 @@ async def _poll(
     total     = 0
 
     async def send_found(addr: str, key: str) -> None:
-        """Edit the status message with the found result."""
+        """Edit the status message with the found result, then auto-send prefix/suffix."""
         elapsed = time.monotonic() - start_time
         rate    = int(total / elapsed) if elapsed > 0 else 0
         # Remove from active jobs without cancelling ourselves
@@ -128,6 +128,12 @@ async def _poll(
         key_id  = f"k{chat_id}"
         result_store[addr_id] = addr
         result_store[key_id]  = key
+
+        # Extract first-3 prefix and last-3 suffix from the found address (skip 0x)
+        body          = addr[2:].lower()
+        auto_prefix   = body[:3]
+        auto_suffix   = body[-3:]
+
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📋 Copy Address",      callback_data=f"copy:{addr_id}")],
             [InlineKeyboardButton("📋 Copy Private Key",  callback_data=f"copy:{key_id}")],
@@ -145,6 +151,15 @@ async def _poll(
             "⚠️ _Keep your private key secret\\. Never share it\\._",
             parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=kb,
+        )
+
+        # Auto-send the first-3 prefix and last-3 suffix for easy copying
+        await status_msg.reply_text(
+            "📋 *Auto\\-copied patterns from your new address:*\n\n"
+            f"🔵 *Prefix \\(first 3\\):*\n`{auto_prefix}`\n\n"
+            f"🟣 *Suffix \\(last 3\\):*\n`{auto_suffix}`\n\n"
+            "_Tap and hold either value to copy\\._",
+            parse_mode=ParseMode.MARKDOWN_V2,
         )
 
     try:
@@ -266,11 +281,12 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🔐 *Vanity Ethereum Address Generator*\n\n"
-        "Paste any Ethereum address and I'll extract the first and last 4 characters automatically\\.\n\n"
+        "Paste any Ethereum address and I'll extract the first and last *6* characters automatically\\.\n\n"
         "*How to use:*\n"
         "1\\. Paste a full Ethereum address\n"
         "2\\. Tap *Match Prefix* or *Match Suffix*\n"
-        "3\\. Wait for your vanity address\\!\n\n"
+        "3\\. Wait for your vanity address\\!\n"
+        "4\\. The first 3 and last 3 chars are auto\\-copied for you 🎉\n\n"
         "*Difficulty Guide:*\n"
         "4 chars \\= \\~65K attempts \\(seconds\\)\n"
         "5 chars \\= \\~1M attempts \\(\\~15 sec\\)\n"
@@ -303,9 +319,10 @@ async def handle_address_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
         "✅ *Address received\\!*\n\n"
         f"`{esc(text)}`\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Extracted patterns:\n\n"
+        "Extracted patterns \\(6 chars each\\):\n\n"
         f"🔵 *Prefix:* `0x{esc(prefix)}…`\n"
         f"🟣 *Suffix:* `0x…{esc(suffix)}`\n\n"
+        "💡 _Once found, the first 3 and last 3 chars will be auto\\-copied for you\\._\n\n"
         "👇 *Which would you like to search for?*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=kb,
