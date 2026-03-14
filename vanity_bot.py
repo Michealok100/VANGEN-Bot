@@ -331,10 +331,22 @@ async def handle_search_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
     query   = update.callback_query
     chat_id = query.message.chat_id
     await query.answer()
-    # callback_data = "search:abc:f9e" → parts[1]=prefix, parts[2]=suffix
-    _, prefix, suffix = query.data.split(":", 2)
 
-    logger.info("DEBUG search: prefix='%s' suffix='%s' raw_data='%s'", prefix, suffix, query.data)
+    parts = query.data.split(":")
+    logger.info("DEBUG search: raw_data='%s' parts=%s", query.data, parts)
+
+    # Reject old-format buttons: search:prefix:xxx or search:suffix:xxx
+    if parts[1] in ("prefix", "suffix"):
+        await query.message.reply_text(
+            "⚠️ *This button is outdated\\.*\n\n"
+            "Please paste your Ethereum address again to get a fresh search button\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    # New format: search:abc:f9e
+    _, prefix, suffix = parts
+    logger.info("DEBUG search: prefix='%s' suffix='%s'", prefix, suffix)
 
     async def send_status(text: str):
         return await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
