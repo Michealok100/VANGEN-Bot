@@ -36,8 +36,8 @@ if not TELEGRAM_BOT_TOKEN:
 # ── Config ────────────────────────────────────────────────────────────────────
 POLL_INTERVAL  = 0.5    # check queue every 0.5s so fast results aren't missed
 EDIT_INTERVAL  = 5.0    # seconds between Telegram message edits
-EXTRACT_CHARS  = 6
-NUM_WORKERS    = 8      # 8 workers — needed for 6-char searches (~16M attempts)
+EXTRACT_CHARS  = 3      # 3-char prefix + 3-char suffix matched simultaneously
+NUM_WORKERS    = 8      # 8 workers — needed for combined prefix+suffix searches
 
 ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _executor      = ThreadPoolExecutor(max_workers=NUM_WORKERS)
@@ -105,14 +105,14 @@ def kill_job(chat_id: int) -> None:
 async def _poll(
     chat_id: int,
     status_msg,
-    pattern: str,
-    mode: str,
+    prefix: str,
+    suffix: str,
     result_queue: queue.Queue,
     stop_event: threading.Event,
     start_time: float,
 ) -> None:
     last_edit = time.monotonic()
-    display   = f"0x{pattern}..." if mode == "prefix" else f"0x...{pattern}"
+    display   = f"0x{prefix}…{suffix}"
     total     = 0
 
     async def send_found(addr: str, key: str) -> None:
@@ -223,13 +223,13 @@ async def _poll(
 #  SEARCH LAUNCHER
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None:
+async def launch_search(chat_id: int, prefix: str, suffix: str, reply_fn) -> None:
     if chat_id in active_jobs:
         kill_job(chat_id)
         await asyncio.sleep(0.3)
 
-    display  = f"0x{pattern}..." if mode == "prefix" else f"0x...{pattern}"
-    expected = estimate_attempts(len(pattern))
+    display  = f"0x{prefix}…{suffix}"
+    expected = estimate_attempts(len(prefix) + len(suffix))
 
     status_msg = await reply_fn(
         "🔄 *Starting vanity search…*\n\n"
@@ -244,19 +244,18 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
     start_time   = time.monotonic()
     loop         = asyncio.get_event_loop()
 
-    # Start worker threads
+    # Start worker threads — pass prefix+suffix, mode="both"
     for i in range(NUM_WORKERS):
-        loop.run_in_executor(_executor, _worker, i, pattern, mode, result_queue, stop_event)
+        loop.run_in_executor(_executor, _worker, i, prefix, suffix, result_queue, stop_event)
 
-    logger.info("Chat %s | mode=%s pattern='%s' | %d workers", chat_id, mode, pattern, NUM_WORKERS)
+    logger.info("Chat %s | mode=both prefix='%s' suffix='%s' | %d workers", chat_id, prefix, suffix, NUM_WORKERS)
 
-    # Start poll task AFTER storing in active_jobs so kill_job works correctly
     task = asyncio.create_task(
         _poll(
             chat_id=chat_id,
             status_msg=status_msg,
-            pattern=pattern,
-            mode=mode,
+            prefix=prefix,
+            suffix=suffix,
             result_queue=result_queue,
             stop_event=stop_event,
             start_time=start_time,
@@ -268,8 +267,8 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
         "task":         task,
         "result_queue": result_queue,
         "start_time":   start_time,
-        "pattern":      pattern,
-        "mode":         mode,
+        "prefix":       prefix,
+        "suffix":       suffix,
         "total":        0,
     }
 
@@ -281,16 +280,15 @@ async def launch_search(chat_id: int, pattern: str, mode: str, reply_fn) -> None
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🔐 *Vanity Ethereum Address Generator*\n\n"
-        "Paste any Ethereum address and I'll extract the first and last *6* characters automatically\\.\n\n"
+        "Paste any Ethereum address and I'll extract the first *3* and last *3* characters, "
+        "then search for an address matching *both* simultaneously\\.\n\n"
         "*How to use:*\n"
         "1\\. Paste a full Ethereum address\n"
-        "2\\. Tap *Match Prefix* or *Match Suffix*\n"
+        "2\\. Tap *Search* to start\n"
         "3\\. Wait for your vanity address\\!\n"
-        "4\\. The first 3 and last 3 chars are auto\\-copied for you 🎉\n\n"
-        "*Difficulty Guide:*\n"
-        "4 chars \\= \\~65K attempts \\(seconds\\)\n"
-        "5 chars \\= \\~1M attempts \\(\\~15 sec\\)\n"
-        "6 chars \\= \\~16M attempts \\(\\~3 min\\)\n\n"
+        "4\\. The prefix and suffix are auto\\-copied for you 🎉\n\n"
+        "*Difficulty:*\n"
+        "3\\+3 chars \\= \\~16M attempts \\(\\~1\\-3 min with fast libs\\)\n\n"
         "Use /cancel to stop an active search\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
@@ -311,19 +309,19 @@ async def handle_address_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
     prefix, suffix = extract_patterns(text)
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🔵 Match Prefix  0x{prefix}…",  callback_data=f"search:prefix:{prefix}")],
-        [InlineKeyboardButton(f"🟣 Match Suffix  0x…{suffix}", callback_data=f"search:suffix:{suffix}")],
+        [InlineKeyboardButton(f"🎯 Search  0x{prefix}…{suffix}", callback_data=f"search:{prefix}:{suffix}")],
     ])
 
     await update.message.reply_text(
         "✅ *Address received\\!*\n\n"
         f"`{esc(text)}`\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Extracted patterns \\(6 chars each\\):\n\n"
-        f"🔵 *Prefix:* `0x{esc(prefix)}…`\n"
-        f"🟣 *Suffix:* `0x…{esc(suffix)}`\n\n"
-        "💡 _Once found, the first 3 and last 3 chars will be auto\\-copied for you\\._\n\n"
-        "👇 *Which would you like to search for?*",
+        "Extracted patterns:\n\n"
+        f"🔵 *Prefix \\(first 3\\):* `0x{esc(prefix)}…`\n"
+        f"🟣 *Suffix \\(last 3\\):* `0x…{esc(suffix)}`\n\n"
+        f"🎯 *Combined:* `0x{esc(prefix)}…{esc(suffix)}`\n\n"
+        "💡 _Searches for an address matching both at once\\._\n\n"
+        "👇 *Tap to start searching:*",
         parse_mode=ParseMode.MARKDOWN_V2,
         reply_markup=kb,
     )
@@ -333,13 +331,13 @@ async def handle_search_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
     query   = update.callback_query
     chat_id = query.message.chat_id
     await query.answer()
-    # callback_data = "search:prefix:dead" → parts[1]=mode, parts[2]=pattern
-    parts   = query.data.split(":", 2)
+    # callback_data = "search:abc:f9e" → parts[1]=prefix, parts[2]=suffix
+    _, prefix, suffix = query.data.split(":", 2)
 
     async def send_status(text: str):
         return await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
 
-    await launch_search(chat_id, parts[2], parts[1], send_status)
+    await launch_search(chat_id, prefix, suffix, send_status)
 
 
 async def handle_refresh_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -360,7 +358,7 @@ async def handle_refresh_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYP
     total   = job.get("total", 0) + sum(i[2] for i in items if i[0] == "progress")
     job["total"] = total
     rate    = int(total / elapsed) if elapsed > 0 else 0
-    display = f"0x{job['pattern']}..." if job["mode"] == "prefix" else f"0x...{job['pattern']}"
+    display = f"0x{job['prefix']}…{job['suffix']}"
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{chat_id}")],
