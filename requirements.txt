@@ -1,6 +1,6 @@
+# updated 2026-03-14
 python-telegram-bot==21.6
 eth-account==0.13.4
 python-dotenv==1.0.1
 pycryptodome==3.20.0
 coincurve==20.0.0
-
