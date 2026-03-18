@@ -10,7 +10,6 @@ import queue
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -40,7 +39,6 @@ EXTRACT_CHARS  = 4      # 4-char prefix + 4-char suffix matched simultaneously
 NUM_WORKERS    = 64     # 64 workers for maximum 4+4 search throughput
 
 ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
-_executor      = ThreadPoolExecutor(max_workers=NUM_WORKERS)
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -248,13 +246,17 @@ async def launch_search(chat_id: int, prefix: str, suffix: str, reply_fn) -> Non
     result_queue = queue.Queue()
     stop_event   = threading.Event()
     start_time   = time.monotonic()
-    loop         = asyncio.get_event_loop()
 
-    # Start worker threads — pass prefix+suffix, mode="both"
+    # Start worker threads directly — more reliable than run_in_executor
     for i in range(NUM_WORKERS):
-        loop.run_in_executor(_executor, _worker, i, prefix, suffix, result_queue, stop_event)
+        t = threading.Thread(
+            target=_worker,
+            args=(i, prefix, suffix, result_queue, stop_event),
+            daemon=True,
+        )
+        t.start()
 
-    logger.info("Chat %s | mode=both prefix='%s' suffix='%s' | %d workers", chat_id, prefix, suffix, NUM_WORKERS)
+    logger.info("Chat %s | prefix='%s' suffix='%s' | %d workers started", chat_id, prefix, suffix, NUM_WORKERS)
 
     task = asyncio.create_task(
         _poll(
