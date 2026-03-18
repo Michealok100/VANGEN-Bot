@@ -42,8 +42,11 @@ ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.DEBUG,
+    level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 active_jobs: dict[int, dict] = {}
@@ -181,7 +184,7 @@ async def _poll(
             if chat_id in active_jobs:
                 active_jobs[chat_id]["total"] = total
 
-            logger.debug("Poll chat=%s total=%d queue_items=%d", chat_id, total, len(items))
+
 
             # Progress edit — only update if we have real data and interval has passed
             now = time.monotonic()
