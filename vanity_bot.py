@@ -44,7 +44,7 @@ _executor      = ThreadPoolExecutor(max_workers=NUM_WORKERS)
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
+    level=logging.DEBUG,
 )
 logger = logging.getLogger(__name__)
 
@@ -111,7 +111,7 @@ async def _poll(
     stop_event: threading.Event,
     start_time: float,
 ) -> None:
-    last_edit = 0.0       # set to 0 so first edit fires immediately
+    last_edit = time.monotonic() - EDIT_INTERVAL  # fires after first interval once total > 0
     display   = f"0x{prefix}...{suffix}"
     total     = 0
 
@@ -183,9 +183,11 @@ async def _poll(
             if chat_id in active_jobs:
                 active_jobs[chat_id]["total"] = total
 
-            # Progress edit
+            logger.debug("Poll chat=%s total=%d queue_items=%d", chat_id, total, len(items))
+
+            # Progress edit — only update if we have real data and interval has passed
             now = time.monotonic()
-            if now - last_edit >= EDIT_INTERVAL:
+            if total > 0 and now - last_edit >= EDIT_INTERVAL:
                 last_edit = now
                 elapsed = now - start_time
                 rate    = int(total / elapsed) if elapsed > 0 else 0
