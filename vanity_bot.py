@@ -35,7 +35,7 @@ if not TELEGRAM_BOT_TOKEN:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 POLL_INTERVAL  = 0.2    # check queue every 0.2s for snappier stats
-EDIT_INTERVAL  = 5.0    # seconds between Telegram message edits
+EDIT_INTERVAL  = 3.0    # seconds between Telegram message edits
 EXTRACT_CHARS  = 4      # 4-char prefix + 4-char suffix matched simultaneously
 NUM_WORKERS    = 64     # 64 workers for maximum 4+4 search throughput
 
@@ -111,7 +111,7 @@ async def _poll(
     stop_event: threading.Event,
     start_time: float,
 ) -> None:
-    last_edit = time.monotonic()
+    last_edit = 0.0       # set to 0 so first edit fires immediately
     display   = f"0x{prefix}...{suffix}"
     total     = 0
 
