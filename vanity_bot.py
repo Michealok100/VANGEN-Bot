@@ -131,7 +131,7 @@ async def _poll(
         result_store[addr_id] = addr
         result_store[key_id]  = key
 
-        # Extract first-4 prefix and last-4 suffix from the found address (skip 0x)
+        # Extract first-4 prefix and last-3 suffix from the found address (skip 0x)
         body          = addr[2:].lower()
         auto_prefix   = body[:PREFIX_CHARS]
         auto_suffix   = body[-SUFFIX_CHARS:]
@@ -155,7 +155,7 @@ async def _poll(
             reply_markup=kb,
         )
 
-        # Auto-send the first-4 prefix and last-4 suffix for easy copying
+        # Auto-send the first-4 prefix and last-3 suffix for easy copying
         await status_msg.reply_text(
             "📋 *Auto\\-copied patterns from your new address:*\n\n"
             f"🔵 *Prefix \\(first 4\\):*\n`{auto_prefix}`\n\n"
@@ -300,7 +300,7 @@ async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "3\\. Wait for your vanity address\\!\n"
         "4\\. The prefix and suffix are auto\\-copied for you 🎉\n\n"
         "*Difficulty:*\n"
-        "4\\+4 chars \\= \\~4\\.3B attempts \\(\\~5\\-30 min with fast libs\\)\n\n"
+        "4\\+3 chars \\= \\~268M attempts \\(\\~15\\-30 min with fast libs\\)\n\n"
         "Use /cancel to stop an active search\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
