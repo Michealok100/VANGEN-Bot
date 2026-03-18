@@ -35,8 +35,9 @@ if not TELEGRAM_BOT_TOKEN:
 # ── Config ────────────────────────────────────────────────────────────────────
 POLL_INTERVAL  = 0.2    # check queue every 0.2s for snappier stats
 EDIT_INTERVAL  = 3.0    # seconds between Telegram message edits
-EXTRACT_CHARS  = 4      # 4-char prefix + 4-char suffix matched simultaneously
-NUM_WORKERS    = 64     # 64 workers for maximum 4+4 search throughput
+PREFIX_CHARS   = 4      # 4-char prefix
+SUFFIX_CHARS   = 3      # 3-char suffix
+NUM_WORKERS    = 4      # 2 vCPU Railway plan — 4 threads is the sweet spot
 
 ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
@@ -64,7 +65,7 @@ def esc(text: str) -> str:
 
 def extract_patterns(address: str) -> tuple[str, str]:
     body = address[2:].lower()
-    return body[:EXTRACT_CHARS], body[-EXTRACT_CHARS:]
+    return body[:PREFIX_CHARS], body[-SUFFIX_CHARS:]
 
 
 def estimate_attempts(n: int) -> str:
@@ -132,8 +133,8 @@ async def _poll(
 
         # Extract first-4 prefix and last-4 suffix from the found address (skip 0x)
         body          = addr[2:].lower()
-        auto_prefix   = body[:4]
-        auto_suffix   = body[-4:]
+        auto_prefix   = body[:PREFIX_CHARS]
+        auto_suffix   = body[-SUFFIX_CHARS:]
 
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📋 Copy Address",      callback_data=f"copy:{addr_id}")],
@@ -158,7 +159,7 @@ async def _poll(
         await status_msg.reply_text(
             "📋 *Auto\\-copied patterns from your new address:*\n\n"
             f"🔵 *Prefix \\(first 4\\):*\n`{auto_prefix}`\n\n"
-            f"🟣 *Suffix \\(last 4\\):*\n`{auto_suffix}`\n\n"
+            f"🟣 *Suffix \\(last 3\\):*\n`{auto_suffix}`\n\n"
             "_Tap and hold either value to copy\\._",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
@@ -291,7 +292,7 @@ async def launch_search(chat_id: int, prefix: str, suffix: str, reply_fn) -> Non
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🔐 *Vanity Ethereum Address Generator*\n\n"
-        "Paste any Ethereum address and I'll extract the first *4* and last *4* characters, "
+        "Paste any Ethereum address and I'll extract the first *4* and last *3* characters, "
         "then search for an address matching *both* simultaneously\\.\n\n"
         "*How to use:*\n"
         "1\\. Paste a full Ethereum address\n"
@@ -329,7 +330,7 @@ async def handle_address_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "Extracted patterns:\n\n"
         f"🔵 *Prefix \\(first 4\\):* `0x{esc(prefix)}...`\n"
-        f"🟣 *Suffix \\(last 4\\):* `0x...{esc(suffix)}`\n\n"
+        f"🟣 *Suffix \\(last 3\\):* `0x...{esc(suffix)}`\n\n"
         f"🎯 *Combined:* `0x{esc(prefix)}...{esc(suffix)}`\n\n"
         "💡 _Searches for an address matching both at once\\._\n\n"
         "👇 *Tap to start searching:*",
@@ -453,6 +454,12 @@ def main() -> None:
     logger.info("Starting VANGEN Bot | %d worker threads", NUM_WORKERS)
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Clear any stale webhook or duplicate polling session
+    import asyncio as _asyncio
+    _asyncio.get_event_loop().run_until_complete(
+        app.bot.delete_webhook(drop_pending_updates=True)
+    )
 
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
