@@ -37,7 +37,7 @@ if not TELEGRAM_BOT_TOKEN:
 POLL_INTERVAL  = 0.5    # check queue every 0.5s so fast results aren't missed
 EDIT_INTERVAL  = 5.0    # seconds between Telegram message edits
 EXTRACT_CHARS  = 4      # 4-char prefix + 4-char suffix matched simultaneously
-NUM_WORKERS    = 32     # 32 workers for faster 4+4 searches
+NUM_WORKERS    = 64     # 64 workers for maximum 4+4 search throughput
 
 ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _executor      = ThreadPoolExecutor(max_workers=NUM_WORKERS)
@@ -178,6 +178,10 @@ async def _poll(
                     total += attempts
                     await send_found(addr, key)
                     return  # done
+
+            # Sync total back to job dict so refresh handler always has latest count
+            if chat_id in active_jobs:
+                active_jobs[chat_id]["total"] = total
 
             # Progress edit
             now = time.monotonic()
@@ -367,10 +371,8 @@ async def handle_refresh_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYP
         )
         return
 
-    items   = drain_queue(job["result_queue"])
     elapsed = time.monotonic() - job["start_time"]
-    total   = job.get("total", 0) + sum(i[2] for i in items if i[0] == "progress")
-    job["total"] = total
+    total   = job.get("total", 0)
     rate    = int(total / elapsed) if elapsed > 0 else 0
     display = f"0x{job['prefix']}...{job['suffix']}"
 
