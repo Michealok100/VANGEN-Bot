@@ -1,9 +1,8 @@
 """
-vanity_worker.py — Vanity address worker using threads (no multiprocessing).
+vanity_worker.py — Vanity address worker using multiprocessing.
 
-coincurve and pysha3 are C extensions that release Python's GIL,
-so threads genuinely run in parallel for this workload.
-This works in all environments including Railway containers.
+Uses multiprocessing instead of threads to bypass Python's GIL entirely,
+giving true parallelism on multi-core machines.
 
 Queue messages:
   ("progress", worker_id, attempt_count)
@@ -11,8 +10,7 @@ Queue messages:
 """
 
 import os
-import threading
-from queue import Queue
+import multiprocessing
 
 REPORT_EVERY = 25_000
 
@@ -36,7 +34,7 @@ def _build_generator():
                 except Exception:
                     continue
 
-        print("[vanity_worker] Generator: coincurve + pycryptodome ✓ (fast)", flush=True)
+        print("[vanity_worker] Generator: coincurve + pycryptodome (fast)", flush=True)
         return _gen
 
     except ImportError:
@@ -56,42 +54,27 @@ def _build_generator():
                 except Exception:
                     continue
 
-        print("[vanity_worker] ⚠ Generator: eth_account (SLOW). Add coincurve + pycryptodome to requirements.txt", flush=True)
+        print("[vanity_worker] WARNING: eth_account (SLOW). Add coincurve + pycryptodome.", flush=True)
         return _gen
 
     except ImportError:
         pass
 
-    raise RuntimeError("No crypto library found. Add coincurve and pycryptodome to requirements.txt")
+    raise RuntimeError("No crypto library found.")
 
 
-_generate = _build_generator()
+# ── Worker process entry point ────────────────────────────────────────────────
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _matches(address: str, prefix: str, suffix: str) -> bool:
-    body = address[2:].lower()
-    return body.startswith(prefix) and body.endswith(suffix)
-
-
-# ── Worker function (runs in a thread) ───────────────────────────────────────
-
-def worker(
-    worker_id: int,
-    prefix: str,
-    suffix: str,
-    result_queue: Queue,
-    stop_event: threading.Event,
-) -> None:
-    attempts  = 0
+def _worker_process(worker_id, prefix, suffix, result_queue, stop_event):
+    """Runs in its own process — bypasses GIL for true parallelism."""
+    generate   = _build_generator()
+    attempts   = 0
     prefix_len = len(prefix)
     suffix_len = len(suffix)
 
     while not stop_event.is_set():
-        # Process in batches to reduce stop_event check overhead
         for i in range(REPORT_EVERY):
-            address, private_key_hex = _generate()
+            address, private_key_hex = generate()
             body = address[2:].lower()
             if body[:prefix_len] == prefix and body[-suffix_len:] == suffix:
                 result_queue.put(("found", worker_id, attempts + i + 1, address, private_key_hex))
@@ -101,3 +84,16 @@ def worker(
         result_queue.put(("progress", worker_id, REPORT_EVERY))
 
     result_queue.put(("progress", worker_id, attempts % REPORT_EVERY))
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def worker(worker_id, prefix, suffix, result_queue, stop_event):
+    """Called from vanity_bot.py — spawns a child process."""
+    p = multiprocessing.Process(
+        target=_worker_process,
+        args=(worker_id, prefix, suffix, result_queue, stop_event),
+        daemon=True,
+    )
+    p.start()
+    p.join()
