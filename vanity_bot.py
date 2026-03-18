@@ -34,7 +34,7 @@ if not TELEGRAM_BOT_TOKEN:
     raise SystemExit("❌ TELEGRAM_BOT_TOKEN not set.")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-POLL_INTERVAL  = 0.5    # check queue every 0.5s so fast results aren't missed
+POLL_INTERVAL  = 0.2    # check queue every 0.2s for snappier stats
 EDIT_INTERVAL  = 5.0    # seconds between Telegram message edits
 EXTRACT_CHARS  = 4      # 4-char prefix + 4-char suffix matched simultaneously
 NUM_WORKERS    = 64     # 64 workers for maximum 4+4 search throughput
