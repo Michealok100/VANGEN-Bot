@@ -90,11 +90,11 @@ def worker(
 
     while not stop_event.is_set():
         # Process in batches to reduce stop_event check overhead
-        for _ in range(REPORT_EVERY):
+        for i in range(REPORT_EVERY):
             address, private_key_hex = _generate()
             body = address[2:].lower()
             if body[:prefix_len] == prefix and body[-suffix_len:] == suffix:
-                result_queue.put(("found", worker_id, attempts, address, private_key_hex))
+                result_queue.put(("found", worker_id, attempts + i + 1, address, private_key_hex))
                 stop_event.set()
                 return
         attempts += REPORT_EVERY
