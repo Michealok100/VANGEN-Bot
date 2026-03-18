@@ -14,7 +14,7 @@ import os
 import threading
 from queue import Queue
 
-REPORT_EVERY = 100_000
+REPORT_EVERY = 25_000
 
 
 # ── Pick fastest available library ───────────────────────────────────────────
