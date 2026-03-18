@@ -6,6 +6,7 @@ Runs on Railway. Uses threads via vanity_worker.py.
 import asyncio
 import logging
 import os
+import multiprocessing
 import queue
 import re
 import threading
@@ -109,8 +110,8 @@ async def _poll(
     status_msg,
     prefix: str,
     suffix: str,
-    result_queue: queue.Queue,
-    stop_event: threading.Event,
+    result_queue,
+    stop_event,
     start_time: float,
 ) -> None:
     last_edit = time.monotonic() - EDIT_INTERVAL  # fires after first interval once total > 0
@@ -247,8 +248,8 @@ async def launch_search(chat_id: int, prefix: str, suffix: str, reply_fn) -> Non
         "_Spinning up workers\\.\\.\\._"
     )
 
-    result_queue = queue.Queue()
-    stop_event   = threading.Event()
+    result_queue = multiprocessing.Queue()
+    stop_event   = multiprocessing.Event()
     start_time   = time.monotonic()
 
     # Start worker threads directly — more reliable than run_in_executor
