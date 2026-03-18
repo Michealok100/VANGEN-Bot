@@ -153,7 +153,7 @@ async def _poll(
             reply_markup=kb,
         )
 
-        # Auto-send the first-3 prefix and last-3 suffix for easy copying
+        # Auto-send the first-4 prefix and last-4 suffix for easy copying
         await status_msg.reply_text(
             "📋 *Auto\\-copied patterns from your new address:*\n\n"
             f"🔵 *Prefix \\(first 4\\):*\n`{auto_prefix}`\n\n"
@@ -344,7 +344,7 @@ async def handle_search_callback(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # New format: search:abc:f9e
+    # New format: search:abcd:f9e2
     _, prefix, suffix = parts
     logger.info("DEBUG search: prefix='%s' suffix='%s'", prefix, suffix)
 
