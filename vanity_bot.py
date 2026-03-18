@@ -36,8 +36,8 @@ if not TELEGRAM_BOT_TOKEN:
 # ── Config ────────────────────────────────────────────────────────────────────
 POLL_INTERVAL  = 0.5    # check queue every 0.5s so fast results aren't missed
 EDIT_INTERVAL  = 5.0    # seconds between Telegram message edits
-EXTRACT_CHARS  = 3      # 3-char prefix + 3-char suffix matched simultaneously
-NUM_WORKERS    = 16     # 16 workers for faster 3+3 searches
+EXTRACT_CHARS  = 4      # 4-char prefix + 4-char suffix matched simultaneously
+NUM_WORKERS    = 32     # 32 workers for faster 4+4 searches
 
 ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _executor      = ThreadPoolExecutor(max_workers=NUM_WORKERS)
@@ -129,10 +129,10 @@ async def _poll(
         result_store[addr_id] = addr
         result_store[key_id]  = key
 
-        # Extract first-3 prefix and last-3 suffix from the found address (skip 0x)
+        # Extract first-4 prefix and last-4 suffix from the found address (skip 0x)
         body          = addr[2:].lower()
-        auto_prefix   = body[:3]
-        auto_suffix   = body[-3:]
+        auto_prefix   = body[:4]
+        auto_suffix   = body[-4:]
 
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📋 Copy Address",      callback_data=f"copy:{addr_id}")],
@@ -156,8 +156,8 @@ async def _poll(
         # Auto-send the first-3 prefix and last-3 suffix for easy copying
         await status_msg.reply_text(
             "📋 *Auto\\-copied patterns from your new address:*\n\n"
-            f"🔵 *Prefix \\(first 3\\):*\n`{auto_prefix}`\n\n"
-            f"🟣 *Suffix \\(last 3\\):*\n`{auto_suffix}`\n\n"
+            f"🔵 *Prefix \\(first 4\\):*\n`{auto_prefix}`\n\n"
+            f"🟣 *Suffix \\(last 4\\):*\n`{auto_suffix}`\n\n"
             "_Tap and hold either value to copy\\._",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
@@ -280,7 +280,7 @@ async def launch_search(chat_id: int, prefix: str, suffix: str, reply_fn) -> Non
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🔐 *Vanity Ethereum Address Generator*\n\n"
-        "Paste any Ethereum address and I'll extract the first *3* and last *3* characters, "
+        "Paste any Ethereum address and I'll extract the first *4* and last *4* characters, "
         "then search for an address matching *both* simultaneously\\.\n\n"
         "*How to use:*\n"
         "1\\. Paste a full Ethereum address\n"
@@ -288,7 +288,7 @@ async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "3\\. Wait for your vanity address\\!\n"
         "4\\. The prefix and suffix are auto\\-copied for you 🎉\n\n"
         "*Difficulty:*\n"
-        "3\\+3 chars \\= \\~16M attempts \\(\\~1\\-3 min with fast libs\\)\n\n"
+        "4\\+4 chars \\= \\~4\\.3B attempts \\(\\~5\\-30 min with fast libs\\)\n\n"
         "Use /cancel to stop an active search\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
@@ -317,8 +317,8 @@ async def handle_address_message(update: Update, _ctx: ContextTypes.DEFAULT_TYPE
         f"`{esc(text)}`\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "Extracted patterns:\n\n"
-        f"🔵 *Prefix \\(first 3\\):* `0x{esc(prefix)}...`\n"
-        f"🟣 *Suffix \\(last 3\\):* `0x...{esc(suffix)}`\n\n"
+        f"🔵 *Prefix \\(first 4\\):* `0x{esc(prefix)}...`\n"
+        f"🟣 *Suffix \\(last 4\\):* `0x...{esc(suffix)}`\n\n"
         f"🎯 *Combined:* `0x{esc(prefix)}...{esc(suffix)}`\n\n"
         "💡 _Searches for an address matching both at once\\._\n\n"
         "👇 *Tap to start searching:*",
